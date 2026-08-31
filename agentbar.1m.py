@@ -750,7 +750,16 @@ def title_icon(mood):
     pet = pet_icon(mood)
     if not pet:
         return ICON
-    cached = os.path.join(PET_DIR, f"title-{PET_NAME}-{mood}-v{PET_CACHE_VERSION}.b64")
+    # Keyed on the asar's mtime as well, exactly like pet_icon: without it a new
+    # sprite sheet regenerates the frame but this composite keeps serving the
+    # old one until PET_CACHE_VERSION is bumped in source.
+    try:
+        stamp = int(os.path.getmtime(CODEX_ASAR))
+    except OSError:
+        return ICON
+    cached = os.path.join(
+        PET_DIR, f"title-{PET_NAME}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
+    )
     try:
         with open(cached) as f:
             return f.read()
@@ -1267,6 +1276,8 @@ def main():
     busy = bool((block or {}).get("perHour")) or codex_today > 0
     hit_limit = bool((codex_usage or {}).get("limit_reached")) and bool(codex_wins)
     mood = pet_mood(worst, busy, hit_limit)
+    # two images: the pair for the menu bar title, the pet alone for its own row
+    pet = pet_icon(mood)
     icon = title_icon(mood)
     # ONE title line. SwiftBar cycles multiple title lines in the bar but also
     # repeats every one of them at the top of the dropdown, so a second line
@@ -1335,9 +1346,11 @@ def main():
         else:
             note = "credits: none (plan allowance only)"
         print(f"   {note} | size=11 color={GRAY} trim=false")
-        if icon is not ICON:
+        if pet:
+            # the pet alone here: this row is about him, and the composite
+            # would paste the Claude glyph in front of his own name
             print(
-                f"   {PET_LABEL} · {PET_CAPTIONS.get(mood, mood)} | image={icon} "
+                f"   {PET_LABEL} · {PET_CAPTIONS.get(mood, mood)} | image={pet} "
                 f"size=11 color={GRAY} trim=false"
             )
         if stats.get("codex_error"):
