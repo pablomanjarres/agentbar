@@ -148,12 +148,77 @@ def test_cache_and_optout(ab):
             return
         written = os.listdir(ab.PET_DIR)
         assert len(written) == 1, written
-        # second call must come off disk, so a broken Pillow cannot matter
-        ab.asar_lookup = lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-read"))
-        assert ab.pet_icon("calm") == first
+        # second call must come off disk, so a broken Pillow cannot matter.
+        # Restored afterwards: leaving it stubbed silently broke every later
+        # check that needed a real read.
+        real_lookup = ab.asar_lookup
+        try:
+            ab.asar_lookup = lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-read"))
+            assert ab.pet_icon("calm") == first
+        finally:
+            ab.asar_lookup = real_lookup
         open(ab.HIDE_PET_FLAG, "w").close()
         assert ab.pet_icon("calm") is None, "hide flag ignored"
     print("ok   frames cached per sheet version, hide flag respected")
+
+
+def test_title_keeps_both_marks(ab):
+    """The menu bar icon must still say "Claude" as well as showing the pet.
+
+    Swapping ICON for the pet quietly removed the only sign the item tracks
+    Claude at all, which is exactly how it got lost the first time.
+    """
+    if not os.path.exists(ab.CODEX_ASAR):
+        print("skip title icon (Codex.app not installed)")
+        return
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        print("skip title icon (Pillow not installed)")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ab.PET_DIR = os.path.join(tmp, "pet")
+        ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
+        glyph_w, glyph_h = png_size(ab.ICON)
+        both = ab.title_icon("calm")
+        assert both != ab.ICON, "pet never made it into the title icon"
+        w, h = png_size(both)
+        assert h == glyph_h, f"title icon is {h}px tall, want {glyph_h}"
+        assert w > glyph_w + ab.PET_GAP_PX, f"title icon is only {w}px wide"
+        assert png_dpi(both) == (5669, 5669, 1), "composite lost its 144 dpi"
+
+        # hidden pet, or no Codex at all, falls back to the glyph alone
+        open(ab.HIDE_PET_FLAG, "w").close()
+        assert ab.title_icon("calm") == ab.ICON
+    print(f"ok   title icon carries both marks ({w}x{h}), falls back to the glyph")
+
+
+def test_title_cache_tracks_the_sheet(ab):
+    """A new sprite sheet must invalidate the composite, not only the frame.
+
+    title_icon originally keyed on (name, mood, version) and left out the asar's
+    mtime that pet_icon keys on, so a Codex update regenerated the frame while
+    the composite kept serving the old one indefinitely.
+    """
+    if not os.path.exists(ab.CODEX_ASAR):
+        print("skip title cache (Codex.app not installed)")
+        return
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        print("skip title cache (Pillow not installed)")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ab.PET_DIR = os.path.join(tmp, "pet")
+        ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
+        assert ab.title_icon("calm") != ab.ICON
+        stamp = str(int(os.path.getmtime(ab.CODEX_ASAR)))
+        titles = [n for n in os.listdir(ab.PET_DIR) if n.startswith("title-")]
+        assert titles, os.listdir(ab.PET_DIR)
+        assert stamp in titles[0], f"composite key carries no sheet stamp: {titles[0]}"
+    print("ok   composite cache is keyed on the sprite sheet too")
 
 
 def test_missing_codex(ab):
@@ -170,5 +235,7 @@ if __name__ == "__main__":
     test_asar_lookup(ab)
     test_icons(ab)
     test_cache_and_optout(ab)
+    test_title_keeps_both_marks(ab)
+    test_title_cache_tracks_the_sheet(ab)
     test_missing_codex(ab)  # mutates paths, so it runs last
     print("\nall checks passed")

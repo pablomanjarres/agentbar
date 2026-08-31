@@ -119,6 +119,14 @@ def test_codex_only():
     assert "claude-swap not set up" in out, "no explanation for the missing Claude rows"
     assert "Codex · ChatGPT Pro" in out, "Codex lane missing"
     assert "12% used" in out, "Codex gauge missing"
+
+    # The title carries the Claude glyph AND the pet; the pet's own row must
+    # carry only the pet, or his name gets the Claude mark pasted in front of it.
+    seedy = [l for l in out.splitlines() if "Seedy ·" in l]
+    if seedy:
+        row_img = seedy[0].split("image=")[1].split()[0]
+        title_img = title.split("image=")[1].split()[0]
+        assert row_img != title_img, "the pet's own row is drawing the composite"
     print("ok   Codex-only: Codex draws, no false claude-swap alarm")
 
 
