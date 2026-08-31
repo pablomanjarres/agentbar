@@ -265,6 +265,292 @@ def minor_to_usd(obj):
         return None
 
 
+# --------------------------------------------------------------------------
+# Codex / ChatGPT
+#
+# Same two questions as the Claude side, different plumbing: how much of the
+# rate-limit window is already gone (live, from the account) and what the tokens
+# would have cost on the API (local, from the rollout transcripts).
+# --------------------------------------------------------------------------
+
+# $ per 1M tokens. "cached" prices the cached_input_tokens slice *of* input_tokens,
+# it is not an extra charge on top. From developers.openai.com/api/docs/pricing,
+# cross-checked against litellm; extend or override in
+# ~/.config/agentbar/codex-prices.json rather than editing this file.
+#
+# gpt-5.3-codex-spark is deliberately absent. It is a ChatGPT-Pro-only research
+# preview with no API price at all, so any number here would be invented -- the
+# aggregators that quote one are copying the parent gpt-5.3-codex row. It shows
+# up in the unpriced warning row instead, the same way ccusage gaps do.
+DEFAULT_CODEX_PRICES = {
+    "gpt-5.5": {"in": 5.00, "cached": 0.50, "out": 30.00},
+    "gpt-5.4": {"in": 2.50, "cached": 0.25, "out": 15.00},
+    "gpt-5.4-mini": {"in": 0.75, "cached": 0.075, "out": 4.50},
+    "gpt-5.3-codex": {"in": 1.75, "cached": 0.175, "out": 14.00},
+    "gpt-5.1-codex-mini": {"in": 0.25, "cached": 0.025, "out": 2.00},
+}
+
+TOKEN_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def codex_prices():
+    """Shipped prices overlaid with the user's file, so a new model needs no edit."""
+    prices = dict(DEFAULT_CODEX_PRICES)
+    for name, price in (load_json(CODEX_PRICES_PATH) or {}).items():
+        if isinstance(price, dict) and {"in", "cached", "out"} <= set(price):
+            prices[name] = price
+    return prices
+
+
+def codex_auth():
+    """(access_token, account_id) of the logged-in ChatGPT account, or (None, None)."""
+    tokens = (load_json(CODEX_AUTH) or {}).get("tokens") or {}
+    return tokens.get("access_token"), tokens.get("account_id")
+
+
+def codex_window(w):
+    """One ChatGPT rate-limit window -> the shape the gauge rows already render."""
+    if not isinstance(w, dict) or w.get("used_percent") is None:
+        return None
+    resets_at = w.get("reset_at")
+    secs = w.get("reset_after_seconds")
+    if secs is None and resets_at:
+        secs = resets_at - time.time()
+    return {
+        "pct": float(w.get("used_percent") or 0),
+        "clock": local_clock_ts(resets_at) if resets_at else "?",
+        "countdown": human_dur(secs),
+        "minutes": int((w.get("limit_window_seconds") or 0) // 60),
+        "at": resets_at,
+    }
+
+
+def codex_windows(data):
+    """Every rate-limit window on the account, as (label, window) pairs.
+
+    The account-level pair comes first, then the per-model buckets from
+    additional_rate_limits (GPT-5.3-Codex-Spark carries its own 5h, for one).
+    A model bucket that merely restates an account window is dropped rather than
+    drawn twice.
+    """
+    out, seen = [], set()
+
+    def add(label, w):
+        key = (w["minutes"], w["at"], w["pct"])
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((label, w))
+
+    top = data.get("rate_limit") or {}
+    for key in ("primary_window", "secondary_window"):
+        w = codex_window(top.get(key))
+        if w:
+            add(win_label(w["minutes"]), w)
+    for extra in data.get("additional_rate_limits") or []:
+        name = (extra.get("limit_name") or "model").replace("GPT-", "")
+        sub = extra.get("rate_limit") or {}
+        for key in ("primary_window", "secondary_window"):
+            w = codex_window(sub.get(key))
+            if w:
+                add(f"{name} {win_label(w['minutes'])}", w)
+    return out
+
+
+def fetch_codex_usage():
+    """Live plan, rate-limit windows and credit state for the Codex login.
+
+    The Claude-side mirror of this is fetch_credit_state(). Returns None when
+    Codex is not logged in at all and {"error": ...} when the call fails, so a
+    network blip keeps the last good reading instead of blanking the lane.
+    """
+    token, account = codex_auth()
+    if not token:
+        return None
+    try:
+        data = http_json(
+            CODEX_USAGE_URL,
+            {
+                "Authorization": f"Bearer {token}",
+                "chatgpt-account-id": account or "",
+                "User-Agent": CODEX_UA,
+                "originator": "codex_cli_rs",
+            },
+        )
+    except Exception as e:
+        return {"error": type(e).__name__}
+    credits = data.get("credits") or {}
+    return {
+        "plan": data.get("plan_type"),
+        "email": data.get("email"),
+        "windows": codex_windows(data),
+        "limit_reached": bool((data.get("rate_limit") or {}).get("limit_reached")),
+        "credits": {
+            "has": bool(credits.get("has_credits")),
+            "unlimited": bool(credits.get("unlimited")),
+            "balance": credits.get("balance"),
+        },
+        "at": time.time(),
+    }
+
+
+def parse_rollout(path):
+    """Per-day, per-model token deltas from one Codex rollout transcript.
+
+    info.total_token_usage is CUMULATIVE for the session and a compaction resets
+    it mid-file, so consecutive readings are differenced and any decrease starts
+    a fresh baseline. Summing the sibling last_token_usage instead double-counts
+    repeated events (68,437,053 against a true 66,512,469 on the largest local
+    session); differencing reproduces the final cumulative figure exactly.
+    """
+    days = {}
+    prev = dict.fromkeys(TOKEN_FIELDS, 0)
+    model = None
+    try:
+        handle = open(path, errors="replace")
+    except OSError:
+        return days
+    with handle:
+        for line in handle:
+            # cheap prefilter: most lines are tool output and hold neither field
+            if '"model"' not in line and '"token_count"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            payload = rec.get("payload") or {}
+            if rec.get("type") == "turn_context":
+                model = payload.get("model") or model
+                continue
+            if payload.get("type") != "token_count":
+                continue
+            cur = (payload.get("info") or {}).get("total_token_usage") or {}
+            if not cur:
+                continue
+            cur = {k: cur.get(k) or 0 for k in TOKEN_FIELDS}
+            if cur["total_tokens"] < prev["total_tokens"]:
+                prev = dict.fromkeys(TOKEN_FIELDS, 0)  # compacted, counter restarted
+            delta = {k: max(0, cur[k] - prev[k]) for k in TOKEN_FIELDS}
+            prev = cur
+            if delta["total_tokens"] <= 0:
+                continue
+            try:
+                day = (
+                    datetime.datetime.fromisoformat(
+                        (rec.get("timestamp") or "").replace("Z", "+00:00")
+                    )
+                    .astimezone()
+                    .date()
+                    .isoformat()
+                )
+            except Exception:
+                continue
+            bucket = days.setdefault(day, {}).setdefault(
+                model or "unknown", dict.fromkeys(TOKEN_FIELDS, 0)
+            )
+            for k in TOKEN_FIELDS:
+                bucket[k] += delta[k]
+    return days
+
+
+def codex_scan():
+    """Daily Codex token totals per model, cached one entry per transcript.
+
+    Rollouts are append-only, but a delta walk needs the whole file, so the unit
+    of caching is a file keyed on (mtime, size): untouched sessions are reused and
+    only new or grown ones are re-read. Without it the plugin would re-parse every
+    transcript it has ever seen, once a minute.
+    """
+    cache = load_json(CODEX_SCAN_PATH) or {}
+    known = cache.get("files") or {}
+    fresh, changed = {}, False
+    for root, _dirs, names in os.walk(CODEX_SESSIONS):
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            key = f"{int(stat.st_mtime)}:{stat.st_size}"
+            hit = known.get(path)
+            if hit and hit.get("key") == key:
+                fresh[path] = hit
+                continue
+            fresh[path] = {"key": key, "days": parse_rollout(path)}
+            changed = True
+    if fresh and (changed or len(fresh) != len(known)):
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        atomic_write(CODEX_SCAN_PATH, {"files": fresh})
+
+    days = {}
+    for entry in fresh.values():
+        for day, models in (entry.get("days") or {}).items():
+            target = days.setdefault(day, {})
+            for model, counts in models.items():
+                bucket = target.setdefault(model, dict.fromkeys(TOKEN_FIELDS, 0))
+                for k in TOKEN_FIELDS:
+                    bucket[k] += counts.get(k) or 0
+    return days
+
+
+def codex_cost(model, counts, prices):
+    """API-equivalent USD for one model's tokens, or None when it has no price.
+
+    input_tokens already contains cached_input_tokens, so the cached slice is
+    subtracted out and billed at the cheaper rate instead of being added on top.
+    """
+    price = prices.get(model)
+    if not price:
+        return None
+    cached = counts.get("cached_input_tokens") or 0
+    fresh = max(0, (counts.get("input_tokens") or 0) - cached)
+    written = counts.get("output_tokens") or 0
+    return (
+        fresh * price["in"] + cached * price["cached"] + written * price["out"]
+    ) / 1e6
+
+
+def codex_summary():
+    """Today / month / all-time Codex spend and tokens, plus any unpriced models."""
+    days = codex_scan()
+    prices = codex_prices()
+    today = datetime.date.today().isoformat()
+    out = {
+        "today": {"cost": 0.0, "tokens": 0},
+        "month": {"cost": 0.0, "tokens": 0},
+        "alltime": {"cost": 0.0, "tokens": 0, "days": len(days)},
+        "unpriced": [],
+        "last_day": max(days) if days else None,
+    }
+    unpriced = set()
+    for day, models in days.items():
+        for model, counts in models.items():
+            tokens = counts.get("total_tokens") or 0
+            cost = codex_cost(model, counts, prices)
+            if cost is None:
+                unpriced.add(model)
+                cost = 0.0
+            out["alltime"]["cost"] += cost
+            out["alltime"]["tokens"] += tokens
+            if day[:7] == today[:7]:
+                out["month"]["cost"] += cost
+                out["month"]["tokens"] += tokens
+            if day == today:
+                out["today"]["cost"] += cost
+                out["today"]["tokens"] += tokens
+    out["unpriced"] = sorted(unpriced)
+    return out
+
+
 def refresh_stats(force=False, active_num=None):
     os.makedirs(CACHE_DIR, exist_ok=True)
     st = load_json(STATS_PATH) or {}
