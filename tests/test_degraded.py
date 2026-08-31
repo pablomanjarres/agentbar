@@ -6,6 +6,7 @@ draws, with no false alarm about tooling the user never installed. Nothing here
 touches the network or the real cache: every path is pointed at a temp dir.
 """
 import contextlib
+import datetime
 import importlib.util
 import io
 import os
@@ -16,7 +17,7 @@ import time
 PLUGIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agentbar.1m.py")
 
 
-def load(tmp, *, cswap=True, codex=True, partial_windows=False):
+def load(tmp, *, cswap=True, codex=True, partial_windows=False, stale=False):
     """Fresh module with every filesystem and network dependency stubbed out."""
     spec = importlib.util.spec_from_file_location("agentbar_" + str(id(tmp)), PLUGIN)
     ab = importlib.util.module_from_spec(spec)
@@ -81,8 +82,19 @@ def load(tmp, *, cswap=True, codex=True, partial_windows=False):
         with open(os.path.join(ab.CSWAP_ROOT, "sequence.json"), "w") as f:
             f.write('{"activeAccountNumber":1,"sequence":[1],'
                     '"accounts":{"1":{"email":"me@example.com"}}}')
-        five = '"five_hour":{"pct":40,"clock":"18:00","countdown":"1h 0m"}'
-        seven = '"seven_day":{"pct":55,"clock":"Sep 3","countdown":"3d 0h"}'
+        # cswap freezes `countdown` at fetch time, so a stale cache still reads
+        # like a live number. resets_at is what actually dates the reading.
+        soon = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+        gone = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=14)
+        when = (gone if stale else soon).isoformat()
+        five = (
+            '"five_hour":{"pct":40,"clock":"18:00","countdown":"1h 0m",'
+            f'"resets_at":"{when}"}}'
+        )
+        seven = (
+            '"seven_day":{"pct":55,"clock":"Sep 3","countdown":"3d 0h",'
+            f'"resets_at":"{when}"}}'
+        )
         good = five if partial_windows else five + "," + seven
         with open(os.path.join(ab.CSWAP_ROOT, "cache", "usage.json"), "w") as f:
             f.write('{"accounts":{"1":{"lastGood":{' + good + "}}}}")
@@ -142,9 +154,31 @@ def test_partial_claude_windows():
     print("ok   half-reported Claude windows still render the title")
 
 
+def test_stale_claude_windows():
+    """A window whose reset has passed must not be drawn as a healthy gauge.
+
+    This is the bug that made the menu lie for two weeks: cswap crashed every
+    tick, its cache froze, and the frozen "1h 0m" countdown kept the bar green.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        out = render(load(tmp, cswap=True, codex=False, stale=True))
+    assert "stale reading" in out, "expired window drawn as live"
+    assert "14d" in out, "staleness age not reported"
+    assert "40% used" not in out, "stale percentage still rendered as a gauge"
+    title = out.splitlines()[0]
+    assert "40%" not in title and "55%" not in title, f"stale pct in title: {title}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fresh = render(load(tmp, cswap=True, codex=False, stale=False))
+    assert "stale reading" not in fresh, "live window wrongly marked stale"
+    assert "40% used" in fresh, "live gauge missing"
+    print("ok   expired windows read as stale, live ones still draw")
+
+
 if __name__ == "__main__":
     test_codex_only()
     test_claude_only()
     test_neither()
     test_partial_claude_windows()
+    test_stale_claude_windows()
     print("\nall checks passed")
