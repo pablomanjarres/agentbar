@@ -238,8 +238,9 @@ def fetch_credit_state():
 def fetch_api_month_cost():
     """Console API credits burned this month, via the Admin cost report.
 
-    Returns None when no admin key file is configured (the lane stays hidden),
-    {"error": ...} on fetch failure, {"month_usd": float} on success.
+    Returns None when no admin key file is configured (the menu then prints a
+    "not tracked" row saying where to put one), {"error": ...} on fetch failure,
+    {"month_usd": float} on success.
     Amounts come back as decimal strings in cents.
     """
     try:
@@ -351,30 +352,45 @@ def codex_windows(data):
     The account-level pair comes first, then the per-model buckets from
     additional_rate_limits (GPT-5.3-Codex-Spark carries its own 5h, for one).
     A model bucket that merely restates an account window is dropped rather than
-    drawn twice.
+    drawn twice, but only against the ACCOUNT windows: two different models can
+    legitimately share a length, a reset and a usage figure (any two sitting at
+    0% right after a reset), and collapsing those hides a real limit.
     """
-    out, seen = [], set()
-
-    def add(label, w):
-        key = (w["minutes"], w["at"], w["pct"])
-        if key in seen:
-            return
-        seen.add(key)
-        out.append((label, w))
-
+    out = []
+    account_sigs = set()
     top = data.get("rate_limit") or {}
     for key in ("primary_window", "secondary_window"):
         w = codex_window(top.get(key))
         if w:
-            add(win_label(w["minutes"]), w)
+            account_sigs.add((w["minutes"], w["at"], w["pct"]))
+            out.append((win_label(w["minutes"]), w))
+
+    seen_labels = {label for label, _ in out}
     for extra in data.get("additional_rate_limits") or []:
         name = (extra.get("limit_name") or "model").replace("GPT-", "")
-        sub = extra.get("rate_limit") or {}
+        scoped = extra.get("rate_limit") or {}
         for key in ("primary_window", "secondary_window"):
-            w = codex_window(sub.get(key))
-            if w:
-                add(f"{name} {win_label(w['minutes'])}", w)
+            w = codex_window(scoped.get(key))
+            if not w or (w["minutes"], w["at"], w["pct"]) in account_sigs:
+                continue
+            label = f"{name} {win_label(w['minutes'])}"
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            out.append((label, w))
     return out
+
+
+def fresh_windows(windows):
+    """Drop windows whose own reset time has already gone by.
+
+    codex_usage is deliberately kept when a refresh fails, but a window past its
+    reset_at describes a window that no longer exists. Letting one keep the menu
+    bar red for hours is worse than showing nothing, and it would make a liar of
+    the promise that red means something is about to stop working.
+    """
+    now = time.time()
+    return [(label, w) for label, w in windows if not w.get("at") or w["at"] > now]
 
 
 def fetch_codex_usage():
@@ -397,8 +413,16 @@ def fetch_codex_usage():
                 "originator": "codex_cli_rs",
             },
         )
+        # parsing stays inside the guard: wham/usage is undocumented, and a
+        # shape change (reset_at arriving as an ISO string, say) would otherwise
+        # raise out of main() and take the whole menu bar item down with it
+        return codex_state(data)
     except Exception as e:
         return {"error": type(e).__name__}
+
+
+def codex_state(data):
+    """The slice of a wham/usage payload this plugin draws."""
     credits = data.get("credits") or {}
     return {
         "plan": data.get("plan_type"),
@@ -625,7 +649,11 @@ def refresh_stats(force=False, active_num=None):
 
     # credits + Console API cost: slow lane, also refetch when the active account changed
     acct_changed = active_num is not None and (st.get("credits") or {}).get("acct") != active_num
-    if force or acct_changed or now - st.get("creditsAt", 0) > MONTH_TTL:
+    # "codex_usage" missing means this cache predates the Codex lane, so an
+    # upgrade fetches once immediately instead of showing "usage unavailable"
+    # until the shared slow-lane timer happens to come round.
+    first_codex = "codex_usage" not in st
+    if force or acct_changed or first_codex or now - st.get("creditsAt", 0) > MONTH_TTL:
         cred = fetch_credit_state()
         if cred is not None:
             cred["acct"] = active_num
@@ -938,7 +966,10 @@ def main():
     p5 = (act_usage.get("five_hour") or {}).get("pct")
     p7 = (act_usage.get("seven_day") or {}).get("pct")
     codex_usage = stats.get("codex_usage")
-    codex_pcts = [w["pct"] for _, w in (codex_usage or {}).get("windows") or []]
+    # a cached reading is kept across a failed refresh, so expired windows are
+    # dropped before anything colours the menu bar off them
+    codex_wins = fresh_windows((codex_usage or {}).get("windows") or [])
+    codex_pcts = [w["pct"] for _, w in codex_wins]
     # the warning colour tracks whichever agent is closest to its wall
     all_pcts = [w["pct"] for _, w in account_windows(act_usage)] + codex_pcts
     worst = max(all_pcts) if all_pcts else 0
@@ -950,7 +981,9 @@ def main():
     elif worst >= 75:
         prefix = "🟠 "
     circ = CIRCLED[active - 1] if active and active <= 10 else "•"
-    claude_bit = f"{circ} {p5:.0f}%·{p7:.0f}%" if p5 is not None else circ
+    # an account can report one window without the other; format whatever is there
+    shown = [f"{pct:.0f}%" for pct in (p5, p7) if pct is not None]
+    claude_bit = f"{circ} {'·'.join(shown)}" if shown else circ
     # both agents share one title line so neither is hidden behind a cycle
     codex_bit = f"  {CODEX_MARK} {max(codex_pcts):.0f}%" if codex_pcts else ""
     print(f"{prefix}{claude_bit}{codex_bit} | image={ICON}")
@@ -1007,7 +1040,12 @@ def main():
         plan = (codex_usage.get("plan") or "?").title()
         who = display_email(codex_usage.get("email") or "?", hidden)
         print(f"Codex · ChatGPT {plan} · {who} | size=11 color={GRAY}")
-        print_gauges(codex_usage.get("windows") or [])
+        print_gauges(codex_wins)
+        if not codex_wins and (codex_usage.get("windows") or []):
+            print(
+                f"   windows expired · awaiting a fresh reading "
+                f"| size=11 color={GRAY} trim=false"
+            )
         if codex_usage.get("limit_reached"):
             print(f"   ⚠ rate limit reached | size=11 color={RED} trim=false")
         credits = codex_usage.get("credits") or {}
@@ -1096,10 +1134,12 @@ def main():
     else:
         print(f"   no Codex sessions on this Mac | size=11 color={GRAY}")
 
-    if month and codex_spend.get("month"):
-        both = (month.get("cost") or 0) + (codex_spend["month"].get("cost") or 0)
+    # only worth a row when both agents actually contributed something
+    claude_month = (month or {}).get("cost") or 0
+    codex_month = (codex_spend.get("month") or {}).get("cost") or 0
+    if claude_month and codex_month:
         print(
-            f"Both   {money(both)} this month, both agents "
+            f"Both   {money(claude_month + codex_month)} this month, both agents "
             f"| font=Menlo size=12 color={RUST} trim=false"
         )
 

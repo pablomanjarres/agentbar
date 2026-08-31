@@ -30,7 +30,8 @@ agentbar/
 │                      #   slow lane (15m): Claude OAuth credits, Console cost report,
 │                      #                    Codex wham/usage
 └── tests/
-    └── test_codex.py  # pricing, delta walk, window dedupe, scan cache
+    ├── test_codex.py     # pricing, delta walk, window dedupe, scan cache
+    └── test_degraded.py  # renders the menu with each agent missing
 ```
 
 SwiftBar runs the file once a minute and renders whatever it prints. Everything expensive sits behind a TTL in `~/.swiftbar/.cache/stats.json`, split into a fast local lane and a slow network lane, so the common refresh touches no network at all. The same file re-invokes itself with an argument to handle menu clicks (`switch`, `refresh-stats`, `rebuild-ledger`, `pause-auto`).
@@ -43,6 +44,7 @@ Both agents are drawn by the same code. `print_gauges` takes `(label, window)` p
 |---|---|
 | `agentbar.1m.py` | Plugin entry point, menu renderer, and both data lanes |
 | `tests/test_codex.py` | Checks for the Codex lane, network opt-in behind `--live` |
+| `tests/test_degraded.py` | Renders the menu with each agent missing, so neither lane can depend on the other |
 | `~/.swiftbar/.cache/` | `stats.json` TTL cache, `cost-ledger.json` high-water marks, `codex-scan.json` per-transcript scan |
 | `~/.config/agentbar/codex-prices.json` | Optional per-model price overrides |
 
@@ -80,7 +82,7 @@ Each lane is independent. Codex works with only `codex login` done, Claude works
 
 A model that burns tokens with no price shows up as a warning row rather than quietly reading as $0. Bump `CODEX_SCAN_VERSION` if you change the parser, so cached scans get re-read.
 
-**Claude Console spend (optional).** Drop an Anthropic admin key at `~/.swiftbar/.secrets/anthropic-admin-key` to add a Console API credits row. Without it that lane stays hidden.
+**Claude Console spend (optional).** Drop an Anthropic admin key at `~/.swiftbar/.secrets/anthropic-admin-key` to add a Console API credits row. Without one the menu keeps a grey row saying the lane is not tracked and where to put the key.
 
 ## License
 
