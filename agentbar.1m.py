@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""SwiftBar plugin: claude-swap account gauges + API-equivalent spend.
+"""SwiftBar plugin: one menu bar item for Claude Code and OpenAI Codex.
 
-Data sources (all local):
+Both agents answer the same two questions: how much of the rate-limit window
+is gone, and what the tokens would have cost at API rates.
+
+Claude data sources (all local):
   - ~/.claude-swap-backup/sequence.json + cache/usage.json  (written by the
     `cswap auto` daemon every 60-90s; read here, never fetched)
   - ccusage (npm) over ~/.claude/projects JSONL transcripts, --offline pricing
+
+Codex data sources:
+  - ~/.codex/sessions/**/rollout-*.jsonl for token usage, differenced per
+    session and priced per model (see parse_rollout)
+  - chatgpt.com/backend-api/wham/usage for live rate-limit windows, on the
+    slow lane only
 
 --offline keeps this off the network on a 1m cadence, but ccusage's bundled price
 snapshot lags new models and prices unknown ones at $0 *silently* -- that hid all
@@ -47,6 +56,24 @@ OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 COST_REPORT_URL = "https://api.anthropic.com/v1/organizations/cost_report"
 OAUTH_BETA = "oauth-2025-04-20"  # matches cswap's oauth.py
 UA = "claude-swiftbar-plugin/1.0"
+
+# --- Codex / ChatGPT -------------------------------------------------------
+CODEX_ROOT = os.path.join(HOME, ".codex")
+CODEX_AUTH = os.path.join(CODEX_ROOT, "auth.json")
+CODEX_SESSIONS = os.path.join(CODEX_ROOT, "sessions")
+CODEX_SCAN_PATH = os.path.join(CACHE_DIR, "codex-scan.json")
+# Bump whenever parse_rollout() changes shape or fixes a miscount: the scan
+# cache is keyed on each transcript's (mtime, size), which do NOT change when
+# the parser does, so without this an upgrade would serve the old numbers for
+# every already-seen session, forever.
+CODEX_SCAN_VERSION = 1
+CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
+CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
+# Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
+# itself reads, and it only answers with the originator header set.
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_UA = "codex_cli_rs/0.142.5"
+CODEX_MARK = "\u2733"  # the mark next to Claude's circled number in the title
 
 ENV = dict(os.environ)
 ENV["PATH"] = ":".join(
@@ -211,8 +238,9 @@ def fetch_credit_state():
 def fetch_api_month_cost():
     """Console API credits burned this month, via the Admin cost report.
 
-    Returns None when no admin key file is configured (the lane stays hidden),
-    {"error": ...} on fetch failure, {"month_usd": float} on success.
+    Returns None when no admin key file is configured (the menu then prints a
+    "not tracked" row saying where to put one), {"error": ...} on fetch failure,
+    {"month_usd": float} on success.
     Amounts come back as decimal strings in cents.
     """
     try:
@@ -252,6 +280,319 @@ def minor_to_usd(obj):
         return None
 
 
+# --------------------------------------------------------------------------
+# Codex / ChatGPT
+#
+# Same two questions as the Claude side, different plumbing: how much of the
+# rate-limit window is already gone (live, from the account) and what the tokens
+# would have cost on the API (local, from the rollout transcripts).
+# --------------------------------------------------------------------------
+
+# $ per 1M tokens. "cached" prices the cached_input_tokens slice *of* input_tokens,
+# it is not an extra charge on top. From developers.openai.com/api/docs/pricing,
+# cross-checked against litellm; extend or override in
+# ~/.config/agentbar/codex-prices.json rather than editing this file.
+#
+# gpt-5.3-codex-spark is deliberately absent. It is a ChatGPT-Pro-only research
+# preview with no API price at all, so any number here would be invented -- the
+# aggregators that quote one are copying the parent gpt-5.3-codex row. It shows
+# up in the unpriced warning row instead, the same way ccusage gaps do.
+DEFAULT_CODEX_PRICES = {
+    "gpt-5.5": {"in": 5.00, "cached": 0.50, "out": 30.00},
+    "gpt-5.4": {"in": 2.50, "cached": 0.25, "out": 15.00},
+    "gpt-5.4-mini": {"in": 0.75, "cached": 0.075, "out": 4.50},
+    "gpt-5.3-codex": {"in": 1.75, "cached": 0.175, "out": 14.00},
+    "gpt-5.1-codex-mini": {"in": 0.25, "cached": 0.025, "out": 2.00},
+}
+
+TOKEN_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def codex_prices():
+    """Shipped prices overlaid with the user's file, so a new model needs no edit."""
+    prices = dict(DEFAULT_CODEX_PRICES)
+    for name, price in (load_json(CODEX_PRICES_PATH) or {}).items():
+        if isinstance(price, dict) and {"in", "cached", "out"} <= set(price):
+            prices[name] = price
+    return prices
+
+
+def codex_auth():
+    """(access_token, account_id) of the logged-in ChatGPT account, or (None, None)."""
+    tokens = (load_json(CODEX_AUTH) or {}).get("tokens") or {}
+    return tokens.get("access_token"), tokens.get("account_id")
+
+
+def codex_window(w):
+    """One ChatGPT rate-limit window -> the shape the gauge rows already render."""
+    if not isinstance(w, dict) or w.get("used_percent") is None:
+        return None
+    resets_at = w.get("reset_at")
+    secs = w.get("reset_after_seconds")
+    if secs is None and resets_at:
+        secs = resets_at - time.time()
+    return {
+        "pct": float(w.get("used_percent") or 0),
+        "clock": local_clock_ts(resets_at) if resets_at else "?",
+        "countdown": human_dur(secs),
+        "minutes": int((w.get("limit_window_seconds") or 0) // 60),
+        "at": resets_at,
+    }
+
+
+def codex_windows(data):
+    """Every rate-limit window on the account, as (label, window) pairs.
+
+    The account-level pair comes first, then the per-model buckets from
+    additional_rate_limits (GPT-5.3-Codex-Spark carries its own 5h, for one).
+    A model bucket that merely restates an account window is dropped rather than
+    drawn twice, but only against the ACCOUNT windows: two different models can
+    legitimately share a length, a reset and a usage figure (any two sitting at
+    0% right after a reset), and collapsing those hides a real limit.
+    """
+    out = []
+    account_sigs = set()
+    top = data.get("rate_limit") or {}
+    for key in ("primary_window", "secondary_window"):
+        w = codex_window(top.get(key))
+        if w:
+            account_sigs.add((w["minutes"], w["at"], w["pct"]))
+            out.append((win_label(w["minutes"]), w))
+
+    seen_labels = {label for label, _ in out}
+    for extra in data.get("additional_rate_limits") or []:
+        name = (extra.get("limit_name") or "model").replace("GPT-", "")
+        scoped = extra.get("rate_limit") or {}
+        for key in ("primary_window", "secondary_window"):
+            w = codex_window(scoped.get(key))
+            if not w or (w["minutes"], w["at"], w["pct"]) in account_sigs:
+                continue
+            label = f"{name} {win_label(w['minutes'])}"
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            out.append((label, w))
+    return out
+
+
+def fresh_windows(windows):
+    """Drop windows whose own reset time has already gone by.
+
+    codex_usage is deliberately kept when a refresh fails, but a window past its
+    reset_at describes a window that no longer exists. Letting one keep the menu
+    bar red for hours is worse than showing nothing, and it would make a liar of
+    the promise that red means something is about to stop working.
+    """
+    now = time.time()
+    return [(label, w) for label, w in windows if not w.get("at") or w["at"] > now]
+
+
+def fetch_codex_usage():
+    """Live plan, rate-limit windows and credit state for the Codex login.
+
+    The Claude-side mirror of this is fetch_credit_state(). Returns None when
+    Codex is not logged in at all and {"error": ...} when the call fails, so a
+    network blip keeps the last good reading instead of blanking the lane.
+    """
+    token, account = codex_auth()
+    if not token:
+        return None
+    try:
+        data = http_json(
+            CODEX_USAGE_URL,
+            {
+                "Authorization": f"Bearer {token}",
+                "chatgpt-account-id": account or "",
+                "User-Agent": CODEX_UA,
+                "originator": "codex_cli_rs",
+            },
+        )
+        # parsing stays inside the guard: wham/usage is undocumented, and a
+        # shape change (reset_at arriving as an ISO string, say) would otherwise
+        # raise out of main() and take the whole menu bar item down with it
+        return codex_state(data)
+    except Exception as e:
+        return {"error": type(e).__name__}
+
+
+def codex_state(data):
+    """The slice of a wham/usage payload this plugin draws."""
+    credits = data.get("credits") or {}
+    return {
+        "plan": data.get("plan_type"),
+        "email": data.get("email"),
+        "windows": codex_windows(data),
+        "limit_reached": bool((data.get("rate_limit") or {}).get("limit_reached")),
+        "credits": {
+            "has": bool(credits.get("has_credits")),
+            "unlimited": bool(credits.get("unlimited")),
+            "balance": credits.get("balance"),
+        },
+        "at": time.time(),
+    }
+
+
+def parse_rollout(path):
+    """Per-day, per-model token deltas from one Codex rollout transcript.
+
+    info.total_token_usage is CUMULATIVE for the session and a compaction resets
+    it mid-file, so consecutive readings are differenced and any decrease starts
+    a fresh baseline. Summing the sibling last_token_usage instead double-counts
+    repeated events (68,437,053 against a true 66,512,469 on the largest local
+    session); differencing reproduces the final cumulative figure exactly.
+    """
+    days = {}
+    prev = dict.fromkeys(TOKEN_FIELDS, 0)
+    model = None
+    try:
+        handle = open(path, errors="replace")
+    except OSError:
+        return days
+    with handle:
+        for line in handle:
+            # cheap prefilter: most lines are tool output and hold neither field
+            if '"model"' not in line and '"token_count"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            payload = rec.get("payload") or {}
+            if rec.get("type") == "turn_context":
+                model = payload.get("model") or model
+                continue
+            if payload.get("type") != "token_count":
+                continue
+            cur = (payload.get("info") or {}).get("total_token_usage") or {}
+            if not cur:
+                continue
+            cur = {k: cur.get(k) or 0 for k in TOKEN_FIELDS}
+            if cur["total_tokens"] < prev["total_tokens"]:
+                prev = dict.fromkeys(TOKEN_FIELDS, 0)  # compacted, counter restarted
+            delta = {k: max(0, cur[k] - prev[k]) for k in TOKEN_FIELDS}
+            prev = cur
+            if delta["total_tokens"] <= 0:
+                continue
+            try:
+                day = (
+                    datetime.datetime.fromisoformat(
+                        (rec.get("timestamp") or "").replace("Z", "+00:00")
+                    )
+                    .astimezone()
+                    .date()
+                    .isoformat()
+                )
+            except Exception:
+                continue
+            bucket = days.setdefault(day, {}).setdefault(
+                model or "unknown", dict.fromkeys(TOKEN_FIELDS, 0)
+            )
+            for k in TOKEN_FIELDS:
+                bucket[k] += delta[k]
+    return days
+
+
+def codex_scan():
+    """Daily Codex token totals per model, cached one entry per transcript.
+
+    Rollouts are append-only, but a delta walk needs the whole file, so the unit
+    of caching is a file keyed on (mtime, size): untouched sessions are reused and
+    only new or grown ones are re-read. Without it the plugin would re-parse every
+    transcript it has ever seen, once a minute.
+    """
+    cache = load_json(CODEX_SCAN_PATH) or {}
+    if cache.get("version") != CODEX_SCAN_VERSION:
+        cache = {}  # parser changed under the cache; re-read everything once
+    known = cache.get("files") or {}
+    fresh, changed = {}, False
+    for root, _dirs, names in os.walk(CODEX_SESSIONS):
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            key = f"{int(stat.st_mtime)}:{stat.st_size}"
+            hit = known.get(path)
+            if hit and hit.get("key") == key:
+                fresh[path] = hit
+                continue
+            fresh[path] = {"key": key, "days": parse_rollout(path)}
+            changed = True
+    if fresh and (changed or len(fresh) != len(known)):
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        atomic_write(
+            CODEX_SCAN_PATH, {"version": CODEX_SCAN_VERSION, "files": fresh}
+        )
+
+    days = {}
+    for entry in fresh.values():
+        for day, models in (entry.get("days") or {}).items():
+            target = days.setdefault(day, {})
+            for model, counts in models.items():
+                bucket = target.setdefault(model, dict.fromkeys(TOKEN_FIELDS, 0))
+                for k in TOKEN_FIELDS:
+                    bucket[k] += counts.get(k) or 0
+    return days
+
+
+def codex_cost(model, counts, prices):
+    """API-equivalent USD for one model's tokens, or None when it has no price.
+
+    input_tokens already contains cached_input_tokens, so the cached slice is
+    subtracted out and billed at the cheaper rate instead of being added on top.
+    """
+    price = prices.get(model)
+    if not price:
+        return None
+    cached = counts.get("cached_input_tokens") or 0
+    fresh = max(0, (counts.get("input_tokens") or 0) - cached)
+    written = counts.get("output_tokens") or 0
+    return (
+        fresh * price["in"] + cached * price["cached"] + written * price["out"]
+    ) / 1e6
+
+
+def codex_summary():
+    """Today / month / all-time Codex spend and tokens, plus any unpriced models."""
+    days = codex_scan()
+    prices = codex_prices()
+    today = datetime.date.today().isoformat()
+    out = {
+        "today": {"cost": 0.0, "tokens": 0},
+        "month": {"cost": 0.0, "tokens": 0},
+        "alltime": {"cost": 0.0, "tokens": 0, "days": len(days)},
+        "unpriced": [],
+        "last_day": max(days) if days else None,
+    }
+    unpriced = set()
+    for day, models in days.items():
+        for model, counts in models.items():
+            tokens = counts.get("total_tokens") or 0
+            cost = codex_cost(model, counts, prices)
+            if cost is None:
+                unpriced.add(model)
+                cost = 0.0
+            out["alltime"]["cost"] += cost
+            out["alltime"]["tokens"] += tokens
+            if day[:7] == today[:7]:
+                out["month"]["cost"] += cost
+                out["month"]["tokens"] += tokens
+            if day == today:
+                out["today"]["cost"] += cost
+                out["today"]["tokens"] += tokens
+    out["unpriced"] = sorted(unpriced)
+    return out
+
+
 def refresh_stats(force=False, active_num=None):
     os.makedirs(CACHE_DIR, exist_ok=True)
     st = load_json(STATS_PATH) or {}
@@ -284,6 +625,10 @@ def refresh_stats(force=False, active_num=None):
             }
             st["fastAt"] = now
             changed = True
+        # Codex spend is a local file walk behind a per-transcript cache, so it
+        # rides the fast lane with ccusage rather than the network lane below.
+        st["codex_spend"] = codex_summary()
+        changed = True
         blocks = ccusage(["blocks"])
         if blocks:
             act = next((b for b in blocks.get("blocks", []) if b.get("isActive")), None)
@@ -304,12 +649,27 @@ def refresh_stats(force=False, active_num=None):
 
     # credits + Console API cost: slow lane, also refetch when the active account changed
     acct_changed = active_num is not None and (st.get("credits") or {}).get("acct") != active_num
-    if force or acct_changed or now - st.get("creditsAt", 0) > MONTH_TTL:
+    # "codex_usage" missing means this cache predates the Codex lane, so an
+    # upgrade fetches once immediately instead of showing "usage unavailable"
+    # until the shared slow-lane timer happens to come round.
+    first_codex = "codex_usage" not in st
+    if force or acct_changed or first_codex or now - st.get("creditsAt", 0) > MONTH_TTL:
         cred = fetch_credit_state()
         if cred is not None:
             cred["acct"] = active_num
             st["credits"] = cred
         st["api_cost"] = fetch_api_month_cost()
+        codex = fetch_codex_usage()
+        if codex is None:
+            st["codex_usage"] = None  # Codex never logged in on this Mac
+            st["codex_error"] = None
+        elif codex.get("error"):
+            # keep the last good windows and label them stale rather than
+            # blanking the lane on one failed request
+            st["codex_error"] = codex["error"]
+        else:
+            st["codex_usage"] = codex
+            st["codex_error"] = None
         st["creditsAt"] = now
         changed = True
 
@@ -354,10 +714,86 @@ def rel_age(ts):
 
 def local_clock(iso):
     try:
-        dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.astimezone().strftime("%H:%M")
+        return local_clock_ts(
+            datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+        )
     except Exception:
         return "?"
+
+
+def local_clock_ts(ts):
+    """Unix seconds -> local HH:MM (Codex reports resets as epoch, Claude as ISO)."""
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+    except Exception:
+        return "?"
+
+
+def human_dur(seconds):
+    """Seconds -> the compact countdown shape cswap already writes ("4h 12m")."""
+    try:
+        s = max(0, int(seconds))
+    except Exception:
+        return "?"
+    d, h, m = s // 86400, s // 3600 % 24, s // 60 % 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def win_label(minutes):
+    """Rate-limit window length -> the short label used in the gauge rows."""
+    if not minutes:
+        return "win"
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def print_gauges(windows):
+    """One bar row per rate-limit window. Shared by the Claude and Codex lanes.
+
+    Codex labels are wider than Claude's ("5.3-Codex-Spark 5h"), so the column
+    is sized to the widest label present instead of a fixed width.
+    """
+    windows = list(windows)
+    if not windows:
+        return
+    pad = max(5, max(len(label) for label, _ in windows))
+    for label, w in windows:
+        pct = w.get("pct", 0)
+        reset = f"resets {w.get('clock', '?')} ({w.get('countdown', '?')})"
+        line = (
+            f"   {label:<{pad}} {bar(pct)} {pct:>3.0f}% used · "
+            f"{100 - pct:.0f}% left · {reset}"
+        )
+        print(f"{line} | font=Menlo size=11 trim=false color={state_color(pct)}")
+
+
+def print_rows(rows):
+    """Label + value lines for a spend block."""
+    for label, text in rows:
+        print(f"{label:<6} {text} | font=Menlo size=12 trim=false")
+
+
+def print_unpriced(models, hint):
+    """Warn about models that burned tokens at $0.
+
+    Their spend is missing from every total above, so the figure reads low with
+    no other sign that anything is wrong. This is exactly how ccusage's stale
+    price snapshot once hid all Opus 5 spend.
+    """
+    if not models:
+        return
+    print(
+        f"⚠ {', '.join(models)}: no price — spend above is too low "
+        f"| size=11 color={ORANGE} trim=false"
+    )
+    print(f"   {hint} | size=11 color={GRAY} trim=false")
 
 
 def daemon_running():
@@ -471,6 +907,45 @@ def account_windows(lastgood):
         yield scoped.get("name", "model")[:5], scoped
 
 
+def print_daemon(daemon, hidden):
+    """The claude-swap auto-switch lane. Only drawn when cswap is set up."""
+    if auto_paused():
+        print(f"Auto-switch: PAUSED (you turned it off) | color={ORANGE} size=12")
+        print(
+            f"   stays on the current account until you resume | size=11 color={GRAY} trim=false"
+        )
+        print(
+            f"▶ Resume auto-switch | bash={PLUGIN} param1=resume-auto "
+            f"terminal=false refresh=true size=12 color={GREEN}"
+        )
+    elif daemon:
+        last, last_switch = last_log_events()
+        detail = ""
+        if last:
+            try:
+                ts = datetime.datetime.fromisoformat(
+                    last["ts"].replace("Z", "+00:00")
+                ).timestamp()
+                detail = f" · last check {rel_age(ts)}"
+            except Exception:
+                pass
+        print(f"Auto-switch: running{detail} | color={GREEN} size=12")
+        if last_switch:
+            to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
+            print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
+        print(
+            f"⏸ Pause auto-switch (stay on this account) | bash={PLUGIN} param1=pause-auto "
+            f"terminal=false refresh=true size=12 color={ORANGE}"
+        )
+    else:
+        print(f"Auto-switch daemon NOT running | color={RED} size=12")
+        print(
+            f"   ↳ start: launchctl kickstart {AUTO_TARGET} | "
+            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} "
+            f"terminal=false refresh=true size=11 trim=false"
+        )
+
+
 def main():
     ensure_tui_command()
     seq = load_json(os.path.join(CSWAP_ROOT, "sequence.json")) or {}
@@ -479,6 +954,10 @@ def main():
     active = seq.get("activeAccountNumber")
     order = seq.get("sequence") or sorted(int(k) for k in accounts)
     daemon = daemon_running()
+    # Claude account gauges, the switcher and the daemon lane all come from
+    # claude-swap. Codex-only users have none of it, and telling them a daemon
+    # they never installed is down is a false alarm, so those lanes stay hidden.
+    has_cswap = bool(accounts)
     hidden = os.path.exists(HIDE_EMAILS_FLAG)
     stats = refresh_stats(active_num=active)
 
@@ -486,32 +965,47 @@ def main():
     act_usage = (usage.get(str(active)) or {}).get("lastGood") or {}
     p5 = (act_usage.get("five_hour") or {}).get("pct")
     p7 = (act_usage.get("seven_day") or {}).get("pct")
-    worst = max([w["pct"] for _, w in account_windows(act_usage)] or [0])
+    codex_usage = stats.get("codex_usage")
+    # a cached reading is kept across a failed refresh, so expired windows are
+    # dropped before anything colours the menu bar off them
+    codex_wins = fresh_windows((codex_usage or {}).get("windows") or [])
+    codex_pcts = [w["pct"] for _, w in codex_wins]
+    # the warning colour tracks whichever agent is closest to its wall
+    all_pcts = [w["pct"] for _, w in account_windows(act_usage)] + codex_pcts
+    worst = max(all_pcts) if all_pcts else 0
     prefix = ""
-    if not daemon:
+    if has_cswap and not daemon:
         prefix = "⚠️ "
     elif worst >= 90:
         prefix = "🔴 "
     elif worst >= 75:
         prefix = "🟠 "
     circ = CIRCLED[active - 1] if active and active <= 10 else "•"
-    if p5 is None:
-        print(f"{prefix}{circ} | image={ICON}")
-    else:
-        # two title lines -> SwiftBar cycles them (usage <-> live spend)
-        print(f"{prefix}{circ} {p5:.0f}%·{p7:.0f}% | image={ICON}")
-        today = stats.get("today")
-        block = stats.get("block")
-        if today:
-            spend = f"${today['cost']:,.0f} today"
-            if block and block.get("perHour"):
-                spend += f" · ${block['perHour']:,.0f}/hr"
-            print(f"{prefix}{spend} | image={ICON}")
+    # an account can report one window without the other; format whatever is there
+    shown = [f"{pct:.0f}%" for pct in (p5, p7) if pct is not None]
+    claude_bit = f"{circ} {'·'.join(shown)}" if shown else circ
+    # both agents share one title line so neither is hidden behind a cycle
+    codex_bit = f"  {CODEX_MARK} {max(codex_pcts):.0f}%" if codex_pcts else ""
+    print(f"{prefix}{claude_bit}{codex_bit} | image={ICON}")
+    today = stats.get("today")
+    block = stats.get("block")
+    codex_today = ((stats.get("codex_spend") or {}).get("today") or {}).get("cost") or 0
+    if today or codex_today:
+        # second title line -> SwiftBar cycles them (usage <-> live spend)
+        spend = f"${(today or {}).get('cost', 0) + codex_today:,.0f} today"
+        if block and block.get("perHour"):
+            spend += f" · ${block['perHour']:,.0f}/hr"
+        print(f"{prefix}{spend} | image={ICON}")
     print("---")
 
     # ---- accounts ----
-    print(f"Claude Max accounts · active window used (5h·7d) | size=11 color={GRAY}")
-    for num in order:
+    if has_cswap:
+        print(f"Claude Max accounts · active window used (5h·7d) | size=11 color={GRAY}")
+    else:
+        print(
+            f"Claude accounts · claude-swap not set up, gauges off | size=11 color={GRAY}"
+        )
+    for num in order:  # empty when claude-swap has no accounts
         meta = accounts.get(str(num), {})
         email = meta.get("email", f"account {num}")
         is_active = num == active
@@ -528,12 +1022,7 @@ def main():
                 f"| size=11 color={GRAY} trim=false"
             )
         if lastgood:
-            for label, w in account_windows(lastgood):
-                pct = w.get("pct", 0)
-                left = 100 - pct
-                reset = f"resets {w.get('clock', '?')} ({w.get('countdown', '?')})"
-                line = f"   {label:<5} {bar(pct)} {pct:>3.0f}% used · {left:.0f}% left · {reset}"
-                print(f"{line} | font=Menlo size=11 trim=false color={state_color(pct)}")
+            print_gauges(account_windows(lastgood))
             err = u.get("lastError")
             if err:
                 print(f"   ⚠ {str(err)[:60]} | size=11 color={ORANGE} trim=false")
@@ -545,13 +1034,46 @@ def main():
                 f"param2={num} terminal=false refresh=true size=11 trim=false"
             )
 
+    # ---- codex / chatgpt account ----
+    print("---")
+    if codex_usage:
+        plan = (codex_usage.get("plan") or "?").title()
+        who = display_email(codex_usage.get("email") or "?", hidden)
+        print(f"Codex · ChatGPT {plan} · {who} | size=11 color={GRAY}")
+        print_gauges(codex_wins)
+        if not codex_wins and (codex_usage.get("windows") or []):
+            print(
+                f"   windows expired · awaiting a fresh reading "
+                f"| size=11 color={GRAY} trim=false"
+            )
+        if codex_usage.get("limit_reached"):
+            print(f"   ⚠ rate limit reached | size=11 color={RED} trim=false")
+        credits = codex_usage.get("credits") or {}
+        if credits.get("unlimited"):
+            note = "credits: unlimited"
+        elif credits.get("has"):
+            note = f"credits: balance {credits.get('balance')}"
+        else:
+            note = "credits: none (plan allowance only)"
+        print(f"   {note} | size=11 color={GRAY} trim=false")
+        if stats.get("codex_error"):
+            print(
+                f"   ⚠ refresh failed ({stats['codex_error']}) · showing the reading from "
+                f"{rel_age(codex_usage.get('at', 0))} | size=11 color={ORANGE} trim=false"
+            )
+    elif os.path.exists(CODEX_AUTH):
+        why = f" ({stats['codex_error']})" if stats.get("codex_error") else ""
+        print(f"Codex · ChatGPT | size=11 color={GRAY}")
+        print(f"   usage unavailable{why} | size=11 color={ORANGE} trim=false")
+    else:
+        print(f"Codex · not signed in — run: codex login | size=11 color={GRAY}")
+
     # ---- spend stats ----
     print("---")
-    print(f"API-equivalent spend · both accounts, this Mac | size=11 color={GRAY}")
-    today = stats.get("today")
-    block = stats.get("block")
+    print(f"API-equivalent spend · this Mac | size=11 color={GRAY}")
     month = stats.get("month")
     alltime = stats.get("alltime")
+    print(f"Claude Code | size=11 color={GRAY}")
     if today or alltime:
         rows = []
         if today:
@@ -576,25 +1098,56 @@ def main():
                     f"· {alltime['days']}d",
                 )
             )
-        for label, text in rows:
-            print(f"{label:<6} {text} | font=Menlo size=12 trim=false")
-        unpriced = stats.get("unpriced") or []
-        if unpriced:
-            print(
-                f"⚠ {', '.join(unpriced)}: no price — spend above is too low "
-                f"| size=11 color={ORANGE} trim=false"
-            )
-            print(
-                f"   add it to pricingOverrides in ~/.claude/ccusage.json "
-                f"| size=11 color={GRAY} trim=false"
-            )
+        print_rows(rows)
+        print_unpriced(
+            stats.get("unpriced"), "add it to pricingOverrides in ~/.claude/ccusage.json"
+        )
     else:
-        print(f"stats not available yet (ccusage) | size=11 color={GRAY}")
+        print(f"   not available yet (ccusage) | size=11 color={GRAY}")
+
+    codex_spend = stats.get("codex_spend") or {}
+    print(f"Codex · ChatGPT | size=11 color={GRAY}")
+    if (codex_spend.get("alltime") or {}).get("days"):
+        print_rows(
+            [
+                (
+                    "Today",
+                    f"{money(codex_spend['today']['cost'])} · "
+                    f"{tokens_h(codex_spend['today']['tokens'])} tok",
+                ),
+                (
+                    "Month",
+                    f"{money(codex_spend['month']['cost'])} · "
+                    f"{tokens_h(codex_spend['month']['tokens'])} tok",
+                ),
+                (
+                    "Total",
+                    f"{money(codex_spend['alltime']['cost'])} · "
+                    f"{tokens_h(codex_spend['alltime']['tokens'])} tok "
+                    f"· {codex_spend['alltime']['days']}d",
+                ),
+            ]
+        )
+        print_unpriced(
+            codex_spend.get("unpriced"), f"add a price in {CODEX_PRICES_PATH}"
+        )
+    else:
+        print(f"   no Codex sessions on this Mac | size=11 color={GRAY}")
+
+    # only worth a row when both agents actually contributed something
+    claude_month = (month or {}).get("cost") or 0
+    codex_month = (codex_spend.get("month") or {}).get("cost") or 0
+    if claude_month and codex_month:
+        print(
+            f"Both   {money(claude_month + codex_month)} this month, both agents "
+            f"| font=Menlo size=12 color={RUST} trim=false"
+        )
 
     # ---- credits & billing lanes ----
     print("---")
     active_email = display_email(accounts.get(str(active), {}).get("email", "?"), hidden)
-    print(f"Credits & billing · {active_email} | size=11 color={GRAY}")
+    whose = f" · {active_email}" if has_cswap else ""
+    print(f"Credits & billing{whose} | size=11 color={GRAY}")
     credits = stats.get("credits")
     if credits:
         sp = credits.get("spend") or {}
@@ -639,42 +1192,9 @@ def main():
         )
 
     # ---- auto-switch daemon ----
-    print("---")
-    if auto_paused():
-        print(f"Auto-switch: PAUSED (you turned it off) | color={ORANGE} size=12")
-        print(
-            f"   stays on the current account until you resume | size=11 color={GRAY} trim=false"
-        )
-        print(
-            f"▶ Resume auto-switch | bash={PLUGIN} param1=resume-auto "
-            f"terminal=false refresh=true size=12 color={GREEN}"
-        )
-    elif daemon:
-        last, last_switch = last_log_events()
-        detail = ""
-        if last:
-            try:
-                ts = datetime.datetime.fromisoformat(
-                    last["ts"].replace("Z", "+00:00")
-                ).timestamp()
-                detail = f" · last check {rel_age(ts)}"
-            except Exception:
-                pass
-        print(f"Auto-switch: running{detail} | color={GREEN} size=12")
-        if last_switch:
-            to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
-            print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
-        print(
-            f"⏸ Pause auto-switch (stay on this account) | bash={PLUGIN} param1=pause-auto "
-            f"terminal=false refresh=true size=12 color={ORANGE}"
-        )
-    else:
-        print(f"Auto-switch daemon NOT running | color={RED} size=12")
-        print(
-            f"   ↳ start: launchctl kickstart {AUTO_TARGET} | "
-            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} "
-            f"terminal=false refresh=true size=11 trim=false"
-        )
+    if has_cswap:
+        print("---")
+        print_daemon(daemon, hidden)
 
     # ---- actions ----
     print("---")
@@ -682,8 +1202,16 @@ def main():
     print(
         f"{toggle_label} | bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"
     )
-    print(f"Open cswap dashboard (TUI) | bash=/usr/bin/open param1={TUI_CMD} terminal=false")
-    print(f"Open auto-switch log | bash=/usr/bin/open param1={AUTO_LOG} terminal=false")
+    if has_cswap:
+        print(
+            f"Open cswap dashboard (TUI) | bash=/usr/bin/open param1={TUI_CMD} terminal=false"
+        )
+    print(
+        f"Open Codex usage settings | bash=/usr/bin/open "
+        f"param1=https://chatgpt.com/codex/settings/usage terminal=false"
+    )
+    if has_cswap:
+        print(f"Open auto-switch log | bash=/usr/bin/open param1={AUTO_LOG} terminal=false")
     print(
         f"Refresh stats now | bash={PLUGIN} param1=refresh-stats terminal=false refresh=true"
     )
@@ -691,7 +1219,7 @@ def main():
         f"Rebuild spend ledger | bash={PLUGIN} param1=rebuild-ledger "
         f"terminal=false refresh=true alternate=true"
     )
-    print(f"claude-swap + ccusage · updates every 1m | size=10 color={GRAY}")
+    print(f"claude-swap + ccusage + codex · updates every 1m | size=10 color={GRAY}")
 
 
 if __name__ == "__main__":
