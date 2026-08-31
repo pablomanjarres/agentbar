@@ -48,6 +48,19 @@ COST_REPORT_URL = "https://api.anthropic.com/v1/organizations/cost_report"
 OAUTH_BETA = "oauth-2025-04-20"  # matches cswap's oauth.py
 UA = "claude-swiftbar-plugin/1.0"
 
+# --- Codex / ChatGPT -------------------------------------------------------
+CODEX_ROOT = os.path.join(HOME, ".codex")
+CODEX_AUTH = os.path.join(CODEX_ROOT, "auth.json")
+CODEX_SESSIONS = os.path.join(CODEX_ROOT, "sessions")
+CODEX_SCAN_PATH = os.path.join(CACHE_DIR, "codex-scan.json")
+CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
+CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
+# Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
+# itself reads, and it only answers with the originator header set.
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_UA = "codex_cli_rs/0.142.5"
+CODEX_MARK = "\u2733"  # the mark next to Claude's circled number in the title
+
 ENV = dict(os.environ)
 ENV["PATH"] = ":".join(
     ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local/bin"), "/usr/bin", "/bin"]
@@ -354,10 +367,44 @@ def rel_age(ts):
 
 def local_clock(iso):
     try:
-        dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.astimezone().strftime("%H:%M")
+        return local_clock_ts(
+            datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+        )
     except Exception:
         return "?"
+
+
+def local_clock_ts(ts):
+    """Unix seconds -> local HH:MM (Codex reports resets as epoch, Claude as ISO)."""
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+    except Exception:
+        return "?"
+
+
+def human_dur(seconds):
+    """Seconds -> the compact countdown shape cswap already writes ("4h 12m")."""
+    try:
+        s = max(0, int(seconds))
+    except Exception:
+        return "?"
+    d, h, m = s // 86400, s // 3600 % 24, s // 60 % 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def win_label(minutes):
+    """Rate-limit window length -> the short label used in the gauge rows."""
+    if not minutes:
+        return "win"
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
 
 
 def daemon_running():
