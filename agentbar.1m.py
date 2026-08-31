@@ -915,6 +915,15 @@ def print_gauges(windows):
     pad = max(5, max(len(label) for label, _ in windows))
     for label, w in windows:
         pct = w.get("pct", 0)
+        if w.get("stale"):
+            # the window already reset, so this percentage describes nothing.
+            # Say so in grey rather than drawing a reassuring green bar.
+            age = f" · {human_dur(w['age'])} old" if w.get("age") else ""
+            print(
+                f"   {label:<{pad}} {'·' * 10} stale reading{age} "
+                f"| font=Menlo size=11 trim=false color={GRAY}"
+            )
+            continue
         reset = f"resets {w.get('clock', '?')} ({w.get('countdown', '?')})"
         line = (
             f"   {label:<{pad}} {bar(pct)} {pct:>3.0f}% used · "
@@ -1050,16 +1059,57 @@ def display_email(email, hidden):
     return f"{local[:1]}•••@{domain[:1]}•••"
 
 
+def claude_window(w):
+    """Normalise one cswap window, recomputing its countdown from resets_at.
+
+    cswap stores `countdown` and `clock` as strings frozen at fetch time, so a
+    cache that stopped updating keeps reading like a live number: this Mac spent
+    two weeks showing "resets 2h 24m" for a window that had expired on Aug 17,
+    because the daemon was crashing every tick and nothing here noticed.
+
+    resets_at is the only self-dating field, so the countdown is derived from it
+    and a window whose reset has already gone by is marked stale instead of being
+    drawn as a healthy gauge.
+    """
+    if not isinstance(w, dict):
+        return None
+    out = {
+        "pct": float(w.get("pct") or 0),
+        "clock": w.get("clock", "?"),
+        "countdown": w.get("countdown", "?"),
+        "stale": False,
+        "age": None,
+    }
+    raw = w.get("resets_at")
+    if not raw:
+        return out  # scoped entries carry only a pct
+    try:
+        at = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return out
+    left = at - time.time()
+    if left <= 0:
+        out["stale"] = True
+        out["age"] = -left
+        out["countdown"] = "expired"
+    else:
+        out["countdown"] = human_dur(left)
+    out["clock"] = local_clock_ts(at)
+    return out
+
+
 def account_windows(lastgood):
-    """Yield (label, window_dict) for every rate-limit window an account has."""
+    """Yield (label, window) for every rate-limit window an account has."""
     if not lastgood:
         return
-    if lastgood.get("five_hour"):
-        yield "5h", lastgood["five_hour"]
-    if lastgood.get("seven_day"):
-        yield "7d", lastgood["seven_day"]
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        w = claude_window(lastgood.get(key))
+        if w:
+            yield label, w
     for scoped in lastgood.get("scoped") or []:
-        yield scoped.get("name", "model")[:5], scoped
+        w = claude_window(scoped)
+        if w:
+            yield scoped.get("name", "model")[:5], w
 
 
 def print_daemon(daemon, hidden):
@@ -1084,7 +1134,18 @@ def print_daemon(daemon, hidden):
                 detail = f" · last check {rel_age(ts)}"
             except Exception:
                 pass
-        print(f"Auto-switch: running{detail} | color={GREEN} size=12")
+        # A live process is not a working one. cswap kept ticking for two weeks
+        # while every tick died on an OverflowError, and this row stayed green
+        # the whole time because it only checked that the daemon existed.
+        failing = (last or {}).get("event") == "error"
+        if failing:
+            print(f"Auto-switch: running but FAILING{detail} | color={RED} size=12")
+            print(
+                f"   {str((last or {}).get('message'))[:70]} | "
+                f"size=11 color={ORANGE} trim=false"
+            )
+        else:
+            print(f"Auto-switch: running{detail} | color={GREEN} size=12")
         if last_switch:
             to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
             print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
@@ -1118,15 +1179,23 @@ def main():
 
     # ---- menu bar title ----
     act_usage = (usage.get(str(active)) or {}).get("lastGood") or {}
-    p5 = (act_usage.get("five_hour") or {}).get("pct")
-    p7 = (act_usage.get("seven_day") or {}).get("pct")
+
+    def live_pct(key):
+        """Percentage for one window, or None once its reset has gone by."""
+        w = claude_window(act_usage.get(key))
+        return None if not w or w.get("stale") else w["pct"]
+
+    p5 = live_pct("five_hour")
+    p7 = live_pct("seven_day")
     codex_usage = stats.get("codex_usage")
     # a cached reading is kept across a failed refresh, so expired windows are
     # dropped before anything colours the menu bar off them
     codex_wins = fresh_windows((codex_usage or {}).get("windows") or [])
     codex_pcts = [w["pct"] for _, w in codex_wins]
     # the warning colour tracks whichever agent is closest to its wall
-    all_pcts = [w["pct"] for _, w in account_windows(act_usage)] + codex_pcts
+    all_pcts = [
+        w["pct"] for _, w in account_windows(act_usage) if not w.get("stale")
+    ] + codex_pcts
     worst = max(all_pcts) if all_pcts else 0
     prefix = ""
     if has_cswap and not daemon:
