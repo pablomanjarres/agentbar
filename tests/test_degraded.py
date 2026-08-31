@@ -11,11 +11,12 @@ import io
 import os
 import sys
 import tempfile
+import time
 
 PLUGIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agentbar.1m.py")
 
 
-def load(tmp, *, cswap=True, codex=True):
+def load(tmp, *, cswap=True, codex=True, partial_windows=False):
     """Fresh module with every filesystem and network dependency stubbed out."""
     spec = importlib.util.spec_from_file_location("agentbar_" + str(id(tmp)), PLUGIN)
     ab = importlib.util.module_from_spec(spec)
@@ -47,8 +48,19 @@ def load(tmp, *, cswap=True, codex=True):
         ab.fetch_codex_usage = lambda: {
             "plan": "pro",
             "email": "someone@example.com",
+            # `at` must be in the future: fresh_windows() drops windows that have
+            # already reset, which is the whole point of that guard
             "windows": [
-                ("7d", {"pct": 12.0, "clock": "16:05", "countdown": "6d 2h", "minutes": 10080, "at": 1}),
+                (
+                    "7d",
+                    {
+                        "pct": 12.0,
+                        "clock": "16:05",
+                        "countdown": "6d 2h",
+                        "minutes": 10080,
+                        "at": time.time() + 6 * 86400,
+                    },
+                ),
             ],
             "limit_reached": False,
             "credits": {"has": False, "unlimited": False, "balance": "0"},
@@ -69,9 +81,11 @@ def load(tmp, *, cswap=True, codex=True):
         with open(os.path.join(ab.CSWAP_ROOT, "sequence.json"), "w") as f:
             f.write('{"activeAccountNumber":1,"sequence":[1],'
                     '"accounts":{"1":{"email":"me@example.com"}}}')
+        five = '"five_hour":{"pct":40,"clock":"18:00","countdown":"1h 0m"}'
+        seven = '"seven_day":{"pct":55,"clock":"Sep 3","countdown":"3d 0h"}'
+        good = five if partial_windows else five + "," + seven
         with open(os.path.join(ab.CSWAP_ROOT, "cache", "usage.json"), "w") as f:
-            f.write('{"accounts":{"1":{"lastGood":{"five_hour":{"pct":40,"clock":"18:00",'
-                    '"countdown":"1h 0m"},"seven_day":{"pct":55,"clock":"Sep 3","countdown":"3d 0h"}}}}}')
+            f.write('{"accounts":{"1":{"lastGood":{' + good + "}}}}")
     return ab
 
 
@@ -117,8 +131,20 @@ def test_neither():
     print("ok   Neither configured: still renders a sane, quiet menu")
 
 
+def test_partial_claude_windows():
+    """An account reporting five_hour but no seven_day must not take the menu down."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = render(load(tmp, cswap=True, codex=True, partial_windows=True))
+    title = out.splitlines()[0]
+    assert "40%" in title, title
+    assert "·55%" not in title, title
+    assert "Claude Max accounts" in out, "menu body did not render"
+    print("ok   half-reported Claude windows still render the title")
+
+
 if __name__ == "__main__":
     test_codex_only()
     test_claude_only()
     test_neither()
+    test_partial_claude_windows()
     print("\nall checks passed")

@@ -140,6 +140,61 @@ def test_window_dedupe(ab):
     print("ok   duplicate account window dropped, model bucket kept")
 
 
+def test_distinct_models_survive(ab):
+    """Two models can share a length, reset and usage without being the same limit.
+
+    Any two buckets sitting at 0% just after a reset look identical on those three
+    fields. Deduping on them alone made a real limit disappear from the menu.
+    """
+    same = {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1788227814}
+    data = {
+        "rate_limit": {"primary_window": None, "secondary_window": None},
+        "additional_rate_limits": [
+            {"limit_name": "GPT-5.3-Codex-Spark", "rate_limit": {"primary_window": same}},
+            {"limit_name": "GPT-5.5-Pro", "rate_limit": {"primary_window": same}},
+        ],
+    }
+    labels = [label for label, _ in ab.codex_windows(data)]
+    assert labels == ["5.3-Codex-Spark 5h", "5.5-Pro 5h"], labels
+    print("ok   two different models at the same usage both survive")
+
+
+def test_fetch_guards_shape_drift(ab):
+    """wham/usage is undocumented; a shape change must not escape into main()."""
+    original_http, original_auth = ab.http_json, ab.codex_auth
+    try:
+        ab.codex_auth = lambda: ("token", "account")
+        ab.http_json = lambda *a, **k: {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 5,
+                    "limit_window_seconds": 300,
+                    "reset_at": "2026-09-01T00:00:00Z",  # epoch turned into a string
+                }
+            },
+        }
+        got = ab.fetch_codex_usage()
+        assert got and got.get("error"), got
+    finally:
+        ab.http_json, ab.codex_auth = original_http, original_auth
+    print("ok   endpoint shape drift returns an error, does not raise")
+
+
+def test_fresh_windows(ab):
+    """A cached window past its own reset says nothing about now."""
+    future = time.time() + 3600
+    windows = [
+        ("5h", {"pct": 95, "at": 1000, "minutes": 300}),
+        ("7d", {"pct": 10, "at": future, "minutes": 10080}),
+        ("no-reset", {"pct": 3, "at": None, "minutes": 60}),
+    ]
+    kept = [label for label, _ in ab.fresh_windows(windows)]
+    assert kept == ["7d", "no-reset"], kept
+    assert ab.fresh_windows([]) == []
+    print("ok   expired windows dropped, undated ones kept")
+
+
 def test_live(ab):
     usage = ab.fetch_codex_usage()
     if usage is None:
@@ -157,6 +212,9 @@ def main():
     test_labels(ab)
     test_cost(ab)
     test_window_dedupe(ab)
+    test_distinct_models_survive(ab)
+    test_fetch_guards_shape_drift(ab)
+    test_fresh_windows(ab)
     test_rollout_deltas(ab)
     test_scan_cache(ab)
     if "--live" in sys.argv:
