@@ -8,7 +8,11 @@
   <img alt="SwiftBar" src="https://img.shields.io/badge/SwiftBar-plugin-1E1E1E?style=flat" />
   <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-c8542a?style=flat" />
   <img alt="status shipped" src="https://img.shields.io/badge/status-shipped-success?style=flat" />
+  <a href="https://pablomanjarres.com/portfolio/projects/agentbar"><img alt="Portfolio" src="https://img.shields.io/badge/portfolio-pablomanjarres.com-c8542a?style=flat" /></a>
+  <a href="https://pablomanjarres.com/oss/agentbar"><img alt="Landing" src="https://img.shields.io/badge/landing-pablo--oss-c8542a?style=flat" /></a>
 </p>
+
+<p align="center"><img src="https://pablomanjarres.com/portfolio/previews/agentbar.png" alt="agentbar in the macOS menu bar" width="720" /></p>
 
 If you run Claude Code and Codex side by side, the thing you actually want to know is which one is about to hit a wall, and how much the day cost. Both tools keep that on disk already, in different shapes, and neither surfaces it while you work. agentbar is a single SwiftBar plugin that reads both and puts them in one menu bar item: percentage of each rate-limit window burned, when it resets, and API-equivalent spend for today, this month and all time. It is one file of stdlib Python with no runtime dependencies of its own.
 
@@ -101,4 +105,8 @@ MIT.
 
 ---
 
-<p align="center">Built by Pablo Manjarres</p>
+<p align="center">
+  <a href="https://pablomanjarres.com/oss/agentbar">Landing</a> ·
+  <a href="https://pablomanjarres.com/portfolio/projects/agentbar">Portfolio write-up</a> ·
+  Built by Pablo Manjarres
+</p>
