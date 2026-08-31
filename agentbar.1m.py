@@ -86,10 +86,14 @@ CODEX_MARK = "\u2733"  # the mark next to Claude's circled number in the title
 CODEX_ASAR = "/Applications/Codex.app/Contents/Resources/app.asar"
 PET_DIR = os.path.join(CACHE_DIR, "pet")
 HIDE_PET_FLAG = os.path.join(CACHE_DIR, "hide-pet")
+# Bump when the crop changes shape: moods, cell geometry or bar height. The
+# cache key is the asar's mtime, which does not move when this file does, so
+# without it a fix would never reach anyone who already has cached frames.
+PET_CACHE_VERSION = 2
 PET_NAME = "seedy"
 PET_LABEL = "Seedy"
 PET_BLURB = "Small green shoots for new ideas."
-PET_BAR_PX = 30  # 15pt: 18pt clipped his sprout against the top of the bar
+PET_BAR_PX = 36  # 18pt at 144 dpi, matching ICON. See the dpi= on save().
 # Frame geometry read off the sheet the Codex app animates. Columns and cell
 # height have been stable across sprite versions; a sheet that does not divide
 # cleanly is treated as unknown art and the pet is skipped rather than drawn
@@ -653,7 +657,10 @@ def asar_lookup(path, wanted):
                 if "files" in entry:
                     walk(entry, full)
                 elif wanted in full.lower() and not found:
-                    found.append(entry)
+                    # entries marked "unpacked" live beside the archive in
+                    # app.asar.unpacked and carry no offset at all
+                    if "offset" in entry:
+                        found.append(entry)
 
         walk(header)
         if not found:
@@ -676,7 +683,9 @@ def pet_icon(mood):
         stamp = int(os.path.getmtime(CODEX_ASAR))
     except OSError:
         return None  # Codex not installed
-    cached = os.path.join(PET_DIR, f"{PET_NAME}-{mood}-{stamp}.b64")
+    cached = os.path.join(
+        PET_DIR, f"{PET_NAME}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
+    )
     try:
         with open(cached) as f:
             return f.read()
@@ -686,10 +695,12 @@ def pet_icon(mood):
         from PIL import Image  # optional: no Pillow, no pet
     except Exception:
         return None
-    blob = asar_lookup(CODEX_ASAR, PET_NAME + "-spritesheet")
-    if not blob:
-        return None
     try:
+        # asar_lookup reads a third-party binary that Codex rewrites on update;
+        # a truncated or mid-write archive must not take the menu bar down
+        blob = asar_lookup(CODEX_ASAR, PET_NAME + "-spritesheet")
+        if not blob:
+            return None
         sheet = Image.open(io.BytesIO(blob)).convert("RGBA")
         cw = sheet.width // PET_COLS
         if sheet.width % PET_COLS or sheet.height % PET_CELL_H:
@@ -704,7 +715,10 @@ def pet_icon(mood):
             (max(1, round(cell.width * scale)), PET_BAR_PX), Image.NEAREST
         )
         buf = io.BytesIO()
-        cell.save(buf, format="PNG", optimize=True)
+        # ICON carries pHYs 5669 (144 dpi) and draws at 18pt. Pillow writes no
+        # pHYs by default, so the frame was read as 72 dpi and drawn at DOUBLE
+        # size: clipped in the bar, and towering over 11pt text in the dropdown.
+        cell.save(buf, format="PNG", optimize=True, dpi=(144, 144))
         data = base64.b64encode(buf.getvalue()).decode()
     except Exception:
         return None
@@ -1130,17 +1144,20 @@ def main():
     today = stats.get("today")
     block = stats.get("block")
     codex_today = ((stats.get("codex_spend") or {}).get("today") or {}).get("cost") or 0
-    # the pet reacts to whichever agent is closest to its wall
+    # the pet reacts to whichever agent is closest to its wall. limit_reached
+    # gets the same freshness gate as the windows: once they have all expired the
+    # cached flag describes a window that is already over.
     busy = bool((block or {}).get("perHour")) or codex_today > 0
-    mood = pet_mood(worst, busy, bool((codex_usage or {}).get("limit_reached")))
+    hit_limit = bool((codex_usage or {}).get("limit_reached")) and bool(codex_wins)
+    mood = pet_mood(worst, busy, hit_limit)
     icon = pet_icon(mood) or ICON
-    print(f"{prefix}{claude_bit}{codex_bit} | image={icon}")
-    if today or codex_today:
-        # second title line -> SwiftBar cycles them (usage <-> live spend)
-        spend = f"${(today or {}).get('cost', 0) + codex_today:,.0f} today"
-        if block and block.get("perHour"):
-            spend += f" · ${block['perHour']:,.0f}/hr"
-        print(f"{prefix}{spend} | image={icon}")
+    # ONE title line. SwiftBar cycles multiple title lines in the bar but also
+    # repeats every one of them at the top of the dropdown, so a second line
+    # showed the icon and its text twice over. Spend rides along here instead,
+    # and the hourly burn stays in the Block row below where it has room.
+    spent = (today or {}).get("cost", 0) + codex_today
+    money_bit = f"  ${spent:,.0f}" if spent else ""
+    print(f"{prefix}{claude_bit}{codex_bit}{money_bit} | image={icon}")
     print("---")
 
     # ---- accounts ----
@@ -1284,12 +1301,19 @@ def main():
     else:
         print(f"   no Codex sessions on this Mac | size=11 color={GRAY}")
 
-    # only worth a row when both agents actually contributed something
-    claude_month = (month or {}).get("cost") or 0
-    codex_month = (codex_spend.get("month") or {}).get("cost") or 0
-    if claude_month and codex_month:
+    # the two numbers that answer "what have these agents cost me", combined
+    both_month = ((month or {}).get("cost") or 0) + (
+        (codex_spend.get("month") or {}).get("cost") or 0
+    )
+    claude_all = alltime or {}
+    codex_all = codex_spend.get("alltime") or {}
+    both_all = (claude_all.get("cost") or 0) + (codex_all.get("cost") or 0)
+    both_tokens = (claude_all.get("tokens") or 0) + (codex_all.get("tokens") or 0)
+    if both_all or both_month:
+        print(f"Both agents | size=11 color={GRAY}")
+        print(f"{'Month':<6} {money(both_month)} | font=Menlo size=12 trim=false")
         print(
-            f"Both   {money(claude_month + codex_month)} this month, both agents "
+            f"{'Total':<6} {money(both_all)} · {tokens_h(both_tokens)} tok "
             f"| font=Menlo size=12 color={RUST} trim=false"
         )
 
