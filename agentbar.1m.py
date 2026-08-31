@@ -26,9 +26,12 @@ Code deletes after 30 days, so its cumulative figures shrink over time.
 
 Actions re-invoke this file with argv: switch <n> | refresh-stats | rebuild-ledger
 """
+import base64
 import datetime
+import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -74,6 +77,43 @@ CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_UA = "codex_cli_rs/0.142.5"
 CODEX_MARK = "\u2733"  # the mark next to Claude's circled number in the title
+
+# --- the Codex pet ---------------------------------------------------------
+# Codex ships desktop "pets": one sprite sheet per pet inside the app's asar.
+# The art is OpenAI's, so this plugin does NOT carry a copy. It reads the sheet
+# out of the local Codex install, crops the frames it needs once, and caches
+# them. No Codex app, no pet. No Pillow, no pet. Nothing else breaks either way.
+CODEX_ASAR = "/Applications/Codex.app/Contents/Resources/app.asar"
+PET_DIR = os.path.join(CACHE_DIR, "pet")
+HIDE_PET_FLAG = os.path.join(CACHE_DIR, "hide-pet")
+# Bump when the crop changes shape: moods, cell geometry or bar height. The
+# cache key is the asar's mtime, which does not move when this file does, so
+# without it a fix would never reach anyone who already has cached frames.
+PET_CACHE_VERSION = 2
+PET_NAME = "seedy"
+PET_LABEL = "Seedy"
+PET_BLURB = "Small green shoots for new ideas."
+PET_BAR_PX = 36  # 18pt at 144 dpi, matching ICON. See the dpi= on save().
+# Frame geometry read off the sheet the Codex app animates. Columns and cell
+# height have been stable across sprite versions; a sheet that does not divide
+# cleanly is treated as unknown art and the pet is skipped rather than drawn
+# from a garbled crop.
+PET_COLS = 8
+PET_CELL_H = 208
+# (row, col) per mood. Rows are the app's own animation states: 0 idle,
+# 7 "running" (sitting at a laptop while a task runs), 5 "failed".
+PET_MOODS = {
+    "calm": (0, 0),
+    "working": (7, 0),
+    "strained": (5, 0),
+    "spent": (5, 2),
+}
+PET_CAPTIONS = {
+    "calm": "plenty of headroom",
+    "working": "on the clock",
+    "strained": "running low",
+    "spent": "out of window",
+}
 
 ENV = dict(os.environ)
 ENV["PATH"] = ":".join(
@@ -593,6 +633,115 @@ def codex_summary():
     return out
 
 
+def asar_lookup(path, wanted):
+    """Byte range of the first archived file whose path contains `wanted`.
+
+    An Electron asar is a small pickle-framed JSON directory followed by every
+    file concatenated, so the whole lookup is four uint32s and one json.loads.
+    Reading it directly avoids shelling out to node just to fetch one sprite.
+    """
+    with open(path, "rb") as f:
+        if struct.unpack("<I", f.read(4))[0] != 4:
+            return None
+        header_size = struct.unpack("<I", f.read(4))[0]
+        f.read(4)
+        json_size = struct.unpack("<I", f.read(4))[0]
+        header = json.loads(f.read(json_size).decode("utf-8"))
+        data_at = 8 + header_size
+
+        found = []
+
+        def walk(node, prefix=""):
+            for name, entry in (node.get("files") or {}).items():
+                full = prefix + "/" + name
+                if "files" in entry:
+                    walk(entry, full)
+                elif wanted in full.lower() and not found:
+                    # entries marked "unpacked" live beside the archive in
+                    # app.asar.unpacked and carry no offset at all
+                    if "offset" in entry:
+                        found.append(entry)
+
+        walk(header)
+        if not found:
+            return None
+        entry = found[0]
+        f.seek(data_at + int(entry["offset"]))
+        return f.read(int(entry["size"]))
+
+
+def pet_icon(mood):
+    """base64 PNG of one pet mood, or None when the pet cannot be drawn.
+
+    Cropped from the sprite sheet in the user's own Codex install and cached per
+    (sheet mtime, mood), so Pillow is touched on a version change and never on a
+    routine refresh.
+    """
+    if os.path.exists(HIDE_PET_FLAG) or mood not in PET_MOODS:
+        return None
+    try:
+        stamp = int(os.path.getmtime(CODEX_ASAR))
+    except OSError:
+        return None  # Codex not installed
+    cached = os.path.join(
+        PET_DIR, f"{PET_NAME}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
+    )
+    try:
+        with open(cached) as f:
+            return f.read()
+    except OSError:
+        pass
+    try:
+        from PIL import Image  # optional: no Pillow, no pet
+    except Exception:
+        return None
+    try:
+        # asar_lookup reads a third-party binary that Codex rewrites on update;
+        # a truncated or mid-write archive must not take the menu bar down
+        blob = asar_lookup(CODEX_ASAR, PET_NAME + "-spritesheet")
+        if not blob:
+            return None
+        sheet = Image.open(io.BytesIO(blob)).convert("RGBA")
+        cw = sheet.width // PET_COLS
+        if sheet.width % PET_COLS or sheet.height % PET_CELL_H:
+            return None  # unfamiliar art, better nothing than a garbled crop
+        row, col = PET_MOODS[mood]
+        if (row + 1) * PET_CELL_H > sheet.height:
+            return None
+        cell = sheet.crop((col * cw, row * PET_CELL_H, (col + 1) * cw, (row + 1) * PET_CELL_H))
+        cell = cell.crop(cell.getbbox() or (0, 0, cw, PET_CELL_H))
+        scale = PET_BAR_PX / cell.height
+        cell = cell.resize(
+            (max(1, round(cell.width * scale)), PET_BAR_PX), Image.NEAREST
+        )
+        buf = io.BytesIO()
+        # ICON carries pHYs 5669 (144 dpi) and draws at 18pt. Pillow writes no
+        # pHYs by default, so the frame was read as 72 dpi and drawn at DOUBLE
+        # size: clipped in the bar, and towering over 11pt text in the dropdown.
+        cell.save(buf, format="PNG", optimize=True, dpi=(144, 144))
+        data = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+    try:
+        os.makedirs(PET_DIR, exist_ok=True)
+        tmp = cached + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, cached)
+    except OSError:
+        pass
+    return data
+
+
+def pet_mood(worst, busy, limit_reached):
+    """Which frame the pet wears, from how close either agent is to its wall."""
+    if limit_reached or worst >= 95:
+        return "spent"
+    if worst >= 80:
+        return "strained"
+    return "working" if busy else "calm"
+
+
 def refresh_stats(force=False, active_num=None):
     os.makedirs(CACHE_DIR, exist_ok=True)
     st = load_json(STATS_PATH) or {}
@@ -766,6 +915,15 @@ def print_gauges(windows):
     pad = max(5, max(len(label) for label, _ in windows))
     for label, w in windows:
         pct = w.get("pct", 0)
+        if w.get("stale"):
+            # the window already reset, so this percentage describes nothing.
+            # Say so in grey rather than drawing a reassuring green bar.
+            age = f" · {human_dur(w['age'])} old" if w.get("age") else ""
+            print(
+                f"   {label:<{pad}} {'·' * 10} stale reading{age} "
+                f"| font=Menlo size=11 trim=false color={GRAY}"
+            )
+            continue
         reset = f"resets {w.get('clock', '?')} ({w.get('countdown', '?')})"
         line = (
             f"   {label:<{pad}} {bar(pct)} {pct:>3.0f}% used · "
@@ -879,6 +1037,12 @@ def handle_action(argv):
         else:
             os.makedirs(CACHE_DIR, exist_ok=True)
             open(HIDE_EMAILS_FLAG, "w").close()
+    elif argv[0] == "toggle-pet":
+        if os.path.exists(HIDE_PET_FLAG):
+            os.remove(HIDE_PET_FLAG)
+        else:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            open(HIDE_PET_FLAG, "w").close()
     elif argv[0] == "pause-auto":
         pause_auto()
     elif argv[0] == "resume-auto":
@@ -895,16 +1059,57 @@ def display_email(email, hidden):
     return f"{local[:1]}•••@{domain[:1]}•••"
 
 
+def claude_window(w):
+    """Normalise one cswap window, recomputing its countdown from resets_at.
+
+    cswap stores `countdown` and `clock` as strings frozen at fetch time, so a
+    cache that stopped updating keeps reading like a live number: this Mac spent
+    two weeks showing "resets 2h 24m" for a window that had expired on Aug 17,
+    because the daemon was crashing every tick and nothing here noticed.
+
+    resets_at is the only self-dating field, so the countdown is derived from it
+    and a window whose reset has already gone by is marked stale instead of being
+    drawn as a healthy gauge.
+    """
+    if not isinstance(w, dict):
+        return None
+    out = {
+        "pct": float(w.get("pct") or 0),
+        "clock": w.get("clock", "?"),
+        "countdown": w.get("countdown", "?"),
+        "stale": False,
+        "age": None,
+    }
+    raw = w.get("resets_at")
+    if not raw:
+        return out  # scoped entries carry only a pct
+    try:
+        at = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return out
+    left = at - time.time()
+    if left <= 0:
+        out["stale"] = True
+        out["age"] = -left
+        out["countdown"] = "expired"
+    else:
+        out["countdown"] = human_dur(left)
+    out["clock"] = local_clock_ts(at)
+    return out
+
+
 def account_windows(lastgood):
-    """Yield (label, window_dict) for every rate-limit window an account has."""
+    """Yield (label, window) for every rate-limit window an account has."""
     if not lastgood:
         return
-    if lastgood.get("five_hour"):
-        yield "5h", lastgood["five_hour"]
-    if lastgood.get("seven_day"):
-        yield "7d", lastgood["seven_day"]
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        w = claude_window(lastgood.get(key))
+        if w:
+            yield label, w
     for scoped in lastgood.get("scoped") or []:
-        yield scoped.get("name", "model")[:5], scoped
+        w = claude_window(scoped)
+        if w:
+            yield scoped.get("name", "model")[:5], w
 
 
 def print_daemon(daemon, hidden):
@@ -929,7 +1134,18 @@ def print_daemon(daemon, hidden):
                 detail = f" · last check {rel_age(ts)}"
             except Exception:
                 pass
-        print(f"Auto-switch: running{detail} | color={GREEN} size=12")
+        # A live process is not a working one. cswap kept ticking for two weeks
+        # while every tick died on an OverflowError, and this row stayed green
+        # the whole time because it only checked that the daemon existed.
+        failing = (last or {}).get("event") == "error"
+        if failing:
+            print(f"Auto-switch: running but FAILING{detail} | color={RED} size=12")
+            print(
+                f"   {str((last or {}).get('message'))[:70]} | "
+                f"size=11 color={ORANGE} trim=false"
+            )
+        else:
+            print(f"Auto-switch: running{detail} | color={GREEN} size=12")
         if last_switch:
             to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
             print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
@@ -963,15 +1179,23 @@ def main():
 
     # ---- menu bar title ----
     act_usage = (usage.get(str(active)) or {}).get("lastGood") or {}
-    p5 = (act_usage.get("five_hour") or {}).get("pct")
-    p7 = (act_usage.get("seven_day") or {}).get("pct")
+
+    def live_pct(key):
+        """Percentage for one window, or None once its reset has gone by."""
+        w = claude_window(act_usage.get(key))
+        return None if not w or w.get("stale") else w["pct"]
+
+    p5 = live_pct("five_hour")
+    p7 = live_pct("seven_day")
     codex_usage = stats.get("codex_usage")
     # a cached reading is kept across a failed refresh, so expired windows are
     # dropped before anything colours the menu bar off them
     codex_wins = fresh_windows((codex_usage or {}).get("windows") or [])
     codex_pcts = [w["pct"] for _, w in codex_wins]
     # the warning colour tracks whichever agent is closest to its wall
-    all_pcts = [w["pct"] for _, w in account_windows(act_usage)] + codex_pcts
+    all_pcts = [
+        w["pct"] for _, w in account_windows(act_usage) if not w.get("stale")
+    ] + codex_pcts
     worst = max(all_pcts) if all_pcts else 0
     prefix = ""
     if has_cswap and not daemon:
@@ -986,16 +1210,23 @@ def main():
     claude_bit = f"{circ} {'·'.join(shown)}" if shown else circ
     # both agents share one title line so neither is hidden behind a cycle
     codex_bit = f"  {CODEX_MARK} {max(codex_pcts):.0f}%" if codex_pcts else ""
-    print(f"{prefix}{claude_bit}{codex_bit} | image={ICON}")
     today = stats.get("today")
     block = stats.get("block")
     codex_today = ((stats.get("codex_spend") or {}).get("today") or {}).get("cost") or 0
-    if today or codex_today:
-        # second title line -> SwiftBar cycles them (usage <-> live spend)
-        spend = f"${(today or {}).get('cost', 0) + codex_today:,.0f} today"
-        if block and block.get("perHour"):
-            spend += f" · ${block['perHour']:,.0f}/hr"
-        print(f"{prefix}{spend} | image={ICON}")
+    # the pet reacts to whichever agent is closest to its wall. limit_reached
+    # gets the same freshness gate as the windows: once they have all expired the
+    # cached flag describes a window that is already over.
+    busy = bool((block or {}).get("perHour")) or codex_today > 0
+    hit_limit = bool((codex_usage or {}).get("limit_reached")) and bool(codex_wins)
+    mood = pet_mood(worst, busy, hit_limit)
+    icon = pet_icon(mood) or ICON
+    # ONE title line. SwiftBar cycles multiple title lines in the bar but also
+    # repeats every one of them at the top of the dropdown, so a second line
+    # showed the icon and its text twice over. Spend rides along here instead,
+    # and the hourly burn stays in the Block row below where it has room.
+    spent = (today or {}).get("cost", 0) + codex_today
+    money_bit = f"  ${spent:,.0f}" if spent else ""
+    print(f"{prefix}{claude_bit}{codex_bit}{money_bit} | image={icon}")
     print("---")
 
     # ---- accounts ----
@@ -1056,6 +1287,11 @@ def main():
         else:
             note = "credits: none (plan allowance only)"
         print(f"   {note} | size=11 color={GRAY} trim=false")
+        if icon is not ICON:
+            print(
+                f"   {PET_LABEL} · {PET_CAPTIONS.get(mood, mood)} | image={icon} "
+                f"size=11 color={GRAY} trim=false"
+            )
         if stats.get("codex_error"):
             print(
                 f"   ⚠ refresh failed ({stats['codex_error']}) · showing the reading from "
@@ -1134,12 +1370,19 @@ def main():
     else:
         print(f"   no Codex sessions on this Mac | size=11 color={GRAY}")
 
-    # only worth a row when both agents actually contributed something
-    claude_month = (month or {}).get("cost") or 0
-    codex_month = (codex_spend.get("month") or {}).get("cost") or 0
-    if claude_month and codex_month:
+    # the two numbers that answer "what have these agents cost me", combined
+    both_month = ((month or {}).get("cost") or 0) + (
+        (codex_spend.get("month") or {}).get("cost") or 0
+    )
+    claude_all = alltime or {}
+    codex_all = codex_spend.get("alltime") or {}
+    both_all = (claude_all.get("cost") or 0) + (codex_all.get("cost") or 0)
+    both_tokens = (claude_all.get("tokens") or 0) + (codex_all.get("tokens") or 0)
+    if both_all or both_month:
+        print(f"Both agents | size=11 color={GRAY}")
+        print(f"{'Month':<6} {money(both_month)} | font=Menlo size=12 trim=false")
         print(
-            f"Both   {money(claude_month + codex_month)} this month, both agents "
+            f"{'Total':<6} {money(both_all)} · {tokens_h(both_tokens)} tok "
             f"| font=Menlo size=12 color={RUST} trim=false"
         )
 
@@ -1198,6 +1441,8 @@ def main():
 
     # ---- actions ----
     print("---")
+    pet_label = "Show the Codex pet" if os.path.exists(HIDE_PET_FLAG) else "Hide the Codex pet"
+    print(f"{pet_label} | bash={PLUGIN} param1=toggle-pet terminal=false refresh=true")
     toggle_label = "Show emails" if hidden else "Hide emails"
     print(
         f"{toggle_label} | bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"

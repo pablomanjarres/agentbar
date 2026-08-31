@@ -8,7 +8,11 @@
   <img alt="SwiftBar" src="https://img.shields.io/badge/SwiftBar-plugin-1E1E1E?style=flat" />
   <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-c8542a?style=flat" />
   <img alt="status shipped" src="https://img.shields.io/badge/status-shipped-success?style=flat" />
+  <a href="https://pablomanjarres.com/portfolio/projects/agentbar"><img alt="Portfolio" src="https://img.shields.io/badge/portfolio-pablomanjarres.com-c8542a?style=flat" /></a>
+  <a href="https://pablomanjarres.com/oss/agentbar"><img alt="Landing" src="https://img.shields.io/badge/landing-pablo--oss-c8542a?style=flat" /></a>
 </p>
+
+<p align="center"><img src="https://pablomanjarres.com/portfolio/previews/agentbar.png" alt="agentbar in the macOS menu bar" width="720" /></p>
 
 If you run Claude Code and Codex side by side, the thing you actually want to know is which one is about to hit a wall, and how much the day cost. Both tools keep that on disk already, in different shapes, and neither surfaces it while you work. agentbar is a single SwiftBar plugin that reads both and puts them in one menu bar item: percentage of each rate-limit window burned, when it resets, and API-equivalent spend for today, this month and all time. It is one file of stdlib Python with no runtime dependencies of its own.
 
@@ -19,6 +23,7 @@ If you run Claude Code and Codex side by side, the thing you actually want to kn
 - **The token walk survives compaction and repeated events.** Codex writes `info.total_token_usage` as a running total per session, and a compaction resets it mid-file. `parse_rollout` differences consecutive readings and treats a decrease as a fresh baseline. Summing the sibling `last_token_usage` instead double-counts: 68,437,053 tokens against a true 66,512,469 on one real session. The test suite asserts the walk reproduces each session's final cumulative figure exactly.
 - **A model with no price is a warning, not a silent zero.** `gpt-5.3-codex-spark` is a ChatGPT-Pro-only research preview with no API price at all, so agentbar ships no number for it and says so in the menu. The aggregators that quote a Spark price are copying its parent model's row. The same guard caught a real gap on the Claude side, where ccusage's bundled price snapshot silently valued every Opus 5 token at $0.
 - **Claude totals do not shrink when transcripts age out.** Claude Code deletes JSONL transcripts after `cleanupPeriodDays`, and ccusage recomputes from whatever still exists, so its lifetime totals used to fall over time. `update_ledger` keeps a per-day high-water mark in `.cache/cost-ledger.json` and month and all-time are summed from that instead.
+- **The Codex pet lives in the menu bar and reacts to your limits.** Codex ships desktop pets, so agentbar wears one. `asar_lookup` parses the Electron archive inside your own Codex.app with four `struct.unpack` calls and pulls out Seedy's sprite sheet, no node and no bundled copy, then `pet_icon` crops the frame that matches your state: idle when you have headroom, sitting at his laptop while you are burning, shouting when a window is nearly gone. The art belongs to OpenAI, so it is read from your install and cached, never committed here, and a test enforces that.
 - **Scanning is incremental and versioned.** Rollout transcripts are cached one entry per file, keyed on `(mtime, size)`, so a 1 minute refresh re-reads only sessions that changed: 0.20s cold over 41 transcripts, 0.00s warm. The cache carries a schema version because neither mtime nor size changes when the parser does, and without it a fix would keep serving the old numbers forever.
 
 ## How it works
@@ -31,7 +36,8 @@ agentbar/
 │                      #                    Codex wham/usage
 └── tests/
     ├── test_codex.py     # pricing, delta walk, window dedupe, scan cache
-    └── test_degraded.py  # renders the menu with each agent missing
+    ├── test_degraded.py  # renders the menu with each agent missing
+    └── test_pet.py       # asar lookup, mood mapping, and no art in the repo
 ```
 
 SwiftBar runs the file once a minute and renders whatever it prints. Everything expensive sits behind a TTL in `~/.swiftbar/.cache/stats.json`, split into a fast local lane and a slow network lane, so the common refresh touches no network at all. The same file re-invokes itself with an argument to handle menu clicks (`switch`, `refresh-stats`, `rebuild-ledger`, `pause-auto`).
@@ -45,6 +51,7 @@ Both agents are drawn by the same code. `print_gauges` takes `(label, window)` p
 | `agentbar.1m.py` | Plugin entry point, menu renderer, and both data lanes |
 | `tests/test_codex.py` | Checks for the Codex lane, network opt-in behind `--live` |
 | `tests/test_degraded.py` | Renders the menu with each agent missing, so neither lane can depend on the other |
+| `tests/test_pet.py` | Pet moods, the asar reader, and a guard that no sprite art is committed |
 | `~/.swiftbar/.cache/` | `stats.json` TTL cache, `cost-ledger.json` high-water marks, `codex-scan.json` per-transcript scan |
 | `~/.config/agentbar/codex-prices.json` | Optional per-model price overrides |
 
@@ -82,6 +89,14 @@ Each lane is independent. Codex works with only `codex login` done, Claude works
 
 A model that burns tokens with no price shows up as a warning row rather than quietly reading as $0. Bump `CODEX_SCAN_VERSION` if you change the parser, so cached scans get re-read.
 
+**The pet (optional).** Seedy needs a local Codex install for the art and Pillow to crop it once per sprite version:
+
+```bash
+pip install pillow
+```
+
+Without either, the menu bar falls back to the Claude Code glyph and nothing else changes. "Hide the Codex pet" in the menu turns him off for good. Everything outside this one feature is stdlib.
+
 **Claude Console spend (optional).** Drop an Anthropic admin key at `~/.swiftbar/.secrets/anthropic-admin-key` to add a Console API credits row. Without one the menu keeps a grey row saying the lane is not tracked and where to put the key.
 
 ## License
@@ -90,4 +105,8 @@ MIT.
 
 ---
 
-<p align="center">Built by Pablo Manjarres</p>
+<p align="center">
+  <a href="https://pablomanjarres.com/oss/agentbar">Landing</a> ·
+  <a href="https://pablomanjarres.com/portfolio/projects/agentbar">Portfolio write-up</a> ·
+  Built by Pablo Manjarres
+</p>
