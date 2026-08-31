@@ -53,6 +53,11 @@ CODEX_ROOT = os.path.join(HOME, ".codex")
 CODEX_AUTH = os.path.join(CODEX_ROOT, "auth.json")
 CODEX_SESSIONS = os.path.join(CODEX_ROOT, "sessions")
 CODEX_SCAN_PATH = os.path.join(CACHE_DIR, "codex-scan.json")
+# Bump whenever parse_rollout() changes shape or fixes a miscount: the scan
+# cache is keyed on each transcript's (mtime, size), which do NOT change when
+# the parser does, so without this an upgrade would serve the old numbers for
+# every already-seen session, forever.
+CODEX_SCAN_VERSION = 1
 CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
 CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
 # Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
@@ -469,6 +474,8 @@ def codex_scan():
     transcript it has ever seen, once a minute.
     """
     cache = load_json(CODEX_SCAN_PATH) or {}
+    if cache.get("version") != CODEX_SCAN_VERSION:
+        cache = {}  # parser changed under the cache; re-read everything once
     known = cache.get("files") or {}
     fresh, changed = {}, False
     for root, _dirs, names in os.walk(CODEX_SESSIONS):
@@ -489,7 +496,9 @@ def codex_scan():
             changed = True
     if fresh and (changed or len(fresh) != len(known)):
         os.makedirs(CACHE_DIR, exist_ok=True)
-        atomic_write(CODEX_SCAN_PATH, {"files": fresh})
+        atomic_write(
+            CODEX_SCAN_PATH, {"version": CODEX_SCAN_VERSION, "files": fresh}
+        )
 
     days = {}
     for entry in fresh.values():
