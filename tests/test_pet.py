@@ -194,6 +194,33 @@ def test_title_keeps_both_marks(ab):
     print(f"ok   title icon carries both marks ({w}x{h}), falls back to the glyph")
 
 
+def test_title_cache_tracks_the_sheet(ab):
+    """A new sprite sheet must invalidate the composite, not only the frame.
+
+    title_icon originally keyed on (name, mood, version) and left out the asar's
+    mtime that pet_icon keys on, so a Codex update regenerated the frame while
+    the composite kept serving the old one indefinitely.
+    """
+    if not os.path.exists(ab.CODEX_ASAR):
+        print("skip title cache (Codex.app not installed)")
+        return
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        print("skip title cache (Pillow not installed)")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ab.PET_DIR = os.path.join(tmp, "pet")
+        ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
+        assert ab.title_icon("calm") != ab.ICON
+        stamp = str(int(os.path.getmtime(ab.CODEX_ASAR)))
+        titles = [n for n in os.listdir(ab.PET_DIR) if n.startswith("title-")]
+        assert titles, os.listdir(ab.PET_DIR)
+        assert stamp in titles[0], f"composite key carries no sheet stamp: {titles[0]}"
+    print("ok   composite cache is keyed on the sprite sheet too")
+
+
 def test_missing_codex(ab):
     ab.CODEX_ASAR = "/nope/Codex.app/Contents/Resources/app.asar"
     ab.HIDE_PET_FLAG = "/nope/hide"
@@ -209,5 +236,6 @@ if __name__ == "__main__":
     test_icons(ab)
     test_cache_and_optout(ab)
     test_title_keeps_both_marks(ab)
+    test_title_cache_tracks_the_sheet(ab)
     test_missing_codex(ab)  # mutates paths, so it runs last
     print("\nall checks passed")
