@@ -10,6 +10,7 @@ import base64
 import importlib.util
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 
@@ -46,15 +47,29 @@ def test_moods(ab):
 
 
 def test_no_art_in_repo():
-    """The sprite must never be committed. It is OpenAI's asset, not ours."""
-    stray = []
-    for base, dirs, names in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", ".claude")]
-        for name in names:
-            if name.lower().endswith((".webp", ".png", ".gif", ".apng")):
-                stray.append(os.path.relpath(os.path.join(base, name), ROOT))
+    """The sprite must never be committed. It is OpenAI's asset, not ours.
+
+    Asks git what is TRACKED rather than walking the working tree: an untracked
+    debug screenshot or a .venv full of Pillow's own test images is not something
+    this repo ships, and failing on those would train people to ignore the check.
+    """
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", ROOT, "ls-files"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        print(f"skip no-art guard (git unavailable: {exc})")
+        return
+    if tracked.returncode != 0:
+        print("skip no-art guard (not a git checkout)")
+        return
+    stray = [
+        line for line in tracked.stdout.splitlines()
+        if line.lower().endswith((".webp", ".png", ".gif", ".apng", ".jpg", ".jpeg"))
+    ]
     assert not stray, f"sprite art must not be committed: {stray}"
-    print("ok   no pet art committed to the repo")
+    print("ok   no pet art tracked in the repo")
 
 
 def test_asar_lookup(ab):
@@ -69,6 +84,26 @@ def test_asar_lookup(ab):
     print(f"ok   asar lookup pulled a {len(blob):,} byte WebP out of Codex.app")
 
 
+def png_dpi(data):
+    """Pixels-per-metre from a PNG's pHYs chunk, or None when it has none.
+
+    SwiftBar sizes menu bar art by physical size, not pixels, so a frame with no
+    pHYs is read as 72 dpi and drawn at double size beside the 144 dpi glyph.
+    """
+    raw = base64.b64decode(data)
+    at = 8
+    while at + 8 <= len(raw):
+        length = struct.unpack(">I", raw[at:at + 4])[0]
+        kind = raw[at + 4:at + 8]
+        if kind == b"pHYs":
+            x, y, unit = struct.unpack(">IIB", raw[at + 8:at + 17])
+            return x, y, unit
+        if kind == b"IDAT":
+            return None
+        at += 12 + length
+    return None
+
+
 def test_icons(ab):
     if not os.path.exists(ab.CODEX_ASAR):
         print("skip pet icons (Codex.app not installed)")
@@ -79,17 +114,25 @@ def test_icons(ab):
         print("skip pet icons (Pillow not installed, pet is optional)")
         return
 
-    seen = {}
-    for mood in ab.PET_MOODS:
-        data = ab.pet_icon(mood)
-        assert data, f"no icon for {mood}"
-        w, h = png_size(data)
-        assert h == ab.PET_BAR_PX, f"{mood} is {h}px tall, want {ab.PET_BAR_PX}"
-        assert 0 < w <= 3 * ab.PET_BAR_PX, f"{mood} is {w}px wide"
-        seen[mood] = data
+    with tempfile.TemporaryDirectory() as tmp:
+        # never touch the real cache: a stale crop there would let this pass
+        # while asserting on artifacts instead of the crop path
+        ab.PET_DIR = os.path.join(tmp, "pet")
+        ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
+        seen = {}
+        for mood in ab.PET_MOODS:
+            data = ab.pet_icon(mood)
+            assert data, f"no icon for {mood}"
+            w, h = png_size(data)
+            assert h == ab.PET_BAR_PX, f"{mood} is {h}px tall, want {ab.PET_BAR_PX}"
+            assert 0 < w <= 3 * ab.PET_BAR_PX, f"{mood} is {w}px wide"
+            dpi = png_dpi(data)
+            assert dpi, f"{mood} has no pHYs chunk, it will draw at double size"
+            assert dpi == (5669, 5669, 1), f"{mood} pHYs is {dpi}, want 144 dpi"
+            seen[mood] = data
     # if the row/col mapping were wrong every mood would return the same frame
     assert len(set(seen.values())) == len(seen), "moods are not distinct frames"
-    print(f"ok   {len(seen)} distinct mood frames, each {ab.PET_BAR_PX}px tall")
+    print(f"ok   {len(seen)} distinct frames, {ab.PET_BAR_PX}px at 144 dpi")
 
 
 def test_cache_and_optout(ab):
