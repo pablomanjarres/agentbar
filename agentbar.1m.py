@@ -89,7 +89,7 @@ HIDE_PET_FLAG = os.path.join(CACHE_DIR, "hide-pet")
 PET_NAME = "seedy"
 PET_LABEL = "Seedy"
 PET_BLURB = "Small green shoots for new ideas."
-PET_BAR_PX = 36  # renders at 18pt, matching ICON
+PET_BAR_PX = 30  # 15pt: 18pt clipped his sprout against the top of the bar
 # Frame geometry read off the sheet the Codex app animates. Columns and cell
 # height have been stable across sprite versions; a sheet that does not divide
 # cleanly is treated as unknown art and the pet is skipped rather than drawn
