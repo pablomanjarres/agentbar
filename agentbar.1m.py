@@ -879,6 +879,45 @@ def account_windows(lastgood):
         yield scoped.get("name", "model")[:5], scoped
 
 
+def print_daemon(daemon, hidden):
+    """The claude-swap auto-switch lane. Only drawn when cswap is set up."""
+    if auto_paused():
+        print(f"Auto-switch: PAUSED (you turned it off) | color={ORANGE} size=12")
+        print(
+            f"   stays on the current account until you resume | size=11 color={GRAY} trim=false"
+        )
+        print(
+            f"▶ Resume auto-switch | bash={PLUGIN} param1=resume-auto "
+            f"terminal=false refresh=true size=12 color={GREEN}"
+        )
+    elif daemon:
+        last, last_switch = last_log_events()
+        detail = ""
+        if last:
+            try:
+                ts = datetime.datetime.fromisoformat(
+                    last["ts"].replace("Z", "+00:00")
+                ).timestamp()
+                detail = f" · last check {rel_age(ts)}"
+            except Exception:
+                pass
+        print(f"Auto-switch: running{detail} | color={GREEN} size=12")
+        if last_switch:
+            to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
+            print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
+        print(
+            f"⏸ Pause auto-switch (stay on this account) | bash={PLUGIN} param1=pause-auto "
+            f"terminal=false refresh=true size=12 color={ORANGE}"
+        )
+    else:
+        print(f"Auto-switch daemon NOT running | color={RED} size=12")
+        print(
+            f"   ↳ start: launchctl kickstart {AUTO_TARGET} | "
+            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} "
+            f"terminal=false refresh=true size=11 trim=false"
+        )
+
+
 def main():
     ensure_tui_command()
     seq = load_json(os.path.join(CSWAP_ROOT, "sequence.json")) or {}
@@ -887,6 +926,10 @@ def main():
     active = seq.get("activeAccountNumber")
     order = seq.get("sequence") or sorted(int(k) for k in accounts)
     daemon = daemon_running()
+    # Claude account gauges, the switcher and the daemon lane all come from
+    # claude-swap. Codex-only users have none of it, and telling them a daemon
+    # they never installed is down is a false alarm, so those lanes stay hidden.
+    has_cswap = bool(accounts)
     hidden = os.path.exists(HIDE_EMAILS_FLAG)
     stats = refresh_stats(active_num=active)
 
@@ -900,7 +943,7 @@ def main():
     all_pcts = [w["pct"] for _, w in account_windows(act_usage)] + codex_pcts
     worst = max(all_pcts) if all_pcts else 0
     prefix = ""
-    if not daemon:
+    if has_cswap and not daemon:
         prefix = "⚠️ "
     elif worst >= 90:
         prefix = "🔴 "
@@ -923,8 +966,13 @@ def main():
     print("---")
 
     # ---- accounts ----
-    print(f"Claude Max accounts · active window used (5h·7d) | size=11 color={GRAY}")
-    for num in order:
+    if has_cswap:
+        print(f"Claude Max accounts · active window used (5h·7d) | size=11 color={GRAY}")
+    else:
+        print(
+            f"Claude accounts · claude-swap not set up, gauges off | size=11 color={GRAY}"
+        )
+    for num in order:  # empty when claude-swap has no accounts
         meta = accounts.get(str(num), {})
         email = meta.get("email", f"account {num}")
         is_active = num == active
@@ -1058,7 +1106,8 @@ def main():
     # ---- credits & billing lanes ----
     print("---")
     active_email = display_email(accounts.get(str(active), {}).get("email", "?"), hidden)
-    print(f"Credits & billing · {active_email} | size=11 color={GRAY}")
+    whose = f" · {active_email}" if has_cswap else ""
+    print(f"Credits & billing{whose} | size=11 color={GRAY}")
     credits = stats.get("credits")
     if credits:
         sp = credits.get("spend") or {}
@@ -1103,42 +1152,9 @@ def main():
         )
 
     # ---- auto-switch daemon ----
-    print("---")
-    if auto_paused():
-        print(f"Auto-switch: PAUSED (you turned it off) | color={ORANGE} size=12")
-        print(
-            f"   stays on the current account until you resume | size=11 color={GRAY} trim=false"
-        )
-        print(
-            f"▶ Resume auto-switch | bash={PLUGIN} param1=resume-auto "
-            f"terminal=false refresh=true size=12 color={GREEN}"
-        )
-    elif daemon:
-        last, last_switch = last_log_events()
-        detail = ""
-        if last:
-            try:
-                ts = datetime.datetime.fromisoformat(
-                    last["ts"].replace("Z", "+00:00")
-                ).timestamp()
-                detail = f" · last check {rel_age(ts)}"
-            except Exception:
-                pass
-        print(f"Auto-switch: running{detail} | color={GREEN} size=12")
-        if last_switch:
-            to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
-            print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
-        print(
-            f"⏸ Pause auto-switch (stay on this account) | bash={PLUGIN} param1=pause-auto "
-            f"terminal=false refresh=true size=12 color={ORANGE}"
-        )
-    else:
-        print(f"Auto-switch daemon NOT running | color={RED} size=12")
-        print(
-            f"   ↳ start: launchctl kickstart {AUTO_TARGET} | "
-            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} "
-            f"terminal=false refresh=true size=11 trim=false"
-        )
+    if has_cswap:
+        print("---")
+        print_daemon(daemon, hidden)
 
     # ---- actions ----
     print("---")
@@ -1146,12 +1162,16 @@ def main():
     print(
         f"{toggle_label} | bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"
     )
-    print(f"Open cswap dashboard (TUI) | bash=/usr/bin/open param1={TUI_CMD} terminal=false")
+    if has_cswap:
+        print(
+            f"Open cswap dashboard (TUI) | bash=/usr/bin/open param1={TUI_CMD} terminal=false"
+        )
     print(
         f"Open Codex usage settings | bash=/usr/bin/open "
         f"param1=https://chatgpt.com/codex/settings/usage terminal=false"
     )
-    print(f"Open auto-switch log | bash=/usr/bin/open param1={AUTO_LOG} terminal=false")
+    if has_cswap:
+        print(f"Open auto-switch log | bash=/usr/bin/open param1={AUTO_LOG} terminal=false")
     print(
         f"Refresh stats now | bash={PLUGIN} param1=refresh-stats terminal=false refresh=true"
     )
