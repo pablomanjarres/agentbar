@@ -26,9 +26,12 @@ Code deletes after 30 days, so its cumulative figures shrink over time.
 
 Actions re-invoke this file with argv: switch <n> | refresh-stats | rebuild-ledger
 """
+import base64
 import datetime
+import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -74,6 +77,39 @@ CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_UA = "codex_cli_rs/0.142.5"
 CODEX_MARK = "\u2733"  # the mark next to Claude's circled number in the title
+
+# --- the Codex pet ---------------------------------------------------------
+# Codex ships desktop "pets": one sprite sheet per pet inside the app's asar.
+# The art is OpenAI's, so this plugin does NOT carry a copy. It reads the sheet
+# out of the local Codex install, crops the frames it needs once, and caches
+# them. No Codex app, no pet. No Pillow, no pet. Nothing else breaks either way.
+CODEX_ASAR = "/Applications/Codex.app/Contents/Resources/app.asar"
+PET_DIR = os.path.join(CACHE_DIR, "pet")
+HIDE_PET_FLAG = os.path.join(CACHE_DIR, "hide-pet")
+PET_NAME = "seedy"
+PET_LABEL = "Seedy"
+PET_BLURB = "Small green shoots for new ideas."
+PET_BAR_PX = 36  # renders at 18pt, matching ICON
+# Frame geometry read off the sheet the Codex app animates. Columns and cell
+# height have been stable across sprite versions; a sheet that does not divide
+# cleanly is treated as unknown art and the pet is skipped rather than drawn
+# from a garbled crop.
+PET_COLS = 8
+PET_CELL_H = 208
+# (row, col) per mood. Rows are the app's own animation states: 0 idle,
+# 7 "running" (sitting at a laptop while a task runs), 5 "failed".
+PET_MOODS = {
+    "calm": (0, 0),
+    "working": (7, 0),
+    "strained": (5, 0),
+    "spent": (5, 2),
+}
+PET_CAPTIONS = {
+    "calm": "plenty of headroom",
+    "working": "on the clock",
+    "strained": "running low",
+    "spent": "out of window",
+}
 
 ENV = dict(os.environ)
 ENV["PATH"] = ":".join(
@@ -593,6 +629,105 @@ def codex_summary():
     return out
 
 
+def asar_lookup(path, wanted):
+    """Byte range of the first archived file whose path contains `wanted`.
+
+    An Electron asar is a small pickle-framed JSON directory followed by every
+    file concatenated, so the whole lookup is four uint32s and one json.loads.
+    Reading it directly avoids shelling out to node just to fetch one sprite.
+    """
+    with open(path, "rb") as f:
+        if struct.unpack("<I", f.read(4))[0] != 4:
+            return None
+        header_size = struct.unpack("<I", f.read(4))[0]
+        f.read(4)
+        json_size = struct.unpack("<I", f.read(4))[0]
+        header = json.loads(f.read(json_size).decode("utf-8"))
+        data_at = 8 + header_size
+
+        found = []
+
+        def walk(node, prefix=""):
+            for name, entry in (node.get("files") or {}).items():
+                full = prefix + "/" + name
+                if "files" in entry:
+                    walk(entry, full)
+                elif wanted in full.lower() and not found:
+                    found.append(entry)
+
+        walk(header)
+        if not found:
+            return None
+        entry = found[0]
+        f.seek(data_at + int(entry["offset"]))
+        return f.read(int(entry["size"]))
+
+
+def pet_icon(mood):
+    """base64 PNG of one pet mood, or None when the pet cannot be drawn.
+
+    Cropped from the sprite sheet in the user's own Codex install and cached per
+    (sheet mtime, mood), so Pillow is touched on a version change and never on a
+    routine refresh.
+    """
+    if os.path.exists(HIDE_PET_FLAG) or mood not in PET_MOODS:
+        return None
+    try:
+        stamp = int(os.path.getmtime(CODEX_ASAR))
+    except OSError:
+        return None  # Codex not installed
+    cached = os.path.join(PET_DIR, f"{PET_NAME}-{mood}-{stamp}.b64")
+    try:
+        with open(cached) as f:
+            return f.read()
+    except OSError:
+        pass
+    try:
+        from PIL import Image  # optional: no Pillow, no pet
+    except Exception:
+        return None
+    blob = asar_lookup(CODEX_ASAR, PET_NAME + "-spritesheet")
+    if not blob:
+        return None
+    try:
+        sheet = Image.open(io.BytesIO(blob)).convert("RGBA")
+        cw = sheet.width // PET_COLS
+        if sheet.width % PET_COLS or sheet.height % PET_CELL_H:
+            return None  # unfamiliar art, better nothing than a garbled crop
+        row, col = PET_MOODS[mood]
+        if (row + 1) * PET_CELL_H > sheet.height:
+            return None
+        cell = sheet.crop((col * cw, row * PET_CELL_H, (col + 1) * cw, (row + 1) * PET_CELL_H))
+        cell = cell.crop(cell.getbbox() or (0, 0, cw, PET_CELL_H))
+        scale = PET_BAR_PX / cell.height
+        cell = cell.resize(
+            (max(1, round(cell.width * scale)), PET_BAR_PX), Image.NEAREST
+        )
+        buf = io.BytesIO()
+        cell.save(buf, format="PNG", optimize=True)
+        data = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+    try:
+        os.makedirs(PET_DIR, exist_ok=True)
+        tmp = cached + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, cached)
+    except OSError:
+        pass
+    return data
+
+
+def pet_mood(worst, busy, limit_reached):
+    """Which frame the pet wears, from how close either agent is to its wall."""
+    if limit_reached or worst >= 95:
+        return "spent"
+    if worst >= 80:
+        return "strained"
+    return "working" if busy else "calm"
+
+
 def refresh_stats(force=False, active_num=None):
     os.makedirs(CACHE_DIR, exist_ok=True)
     st = load_json(STATS_PATH) or {}
@@ -879,6 +1014,12 @@ def handle_action(argv):
         else:
             os.makedirs(CACHE_DIR, exist_ok=True)
             open(HIDE_EMAILS_FLAG, "w").close()
+    elif argv[0] == "toggle-pet":
+        if os.path.exists(HIDE_PET_FLAG):
+            os.remove(HIDE_PET_FLAG)
+        else:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            open(HIDE_PET_FLAG, "w").close()
     elif argv[0] == "pause-auto":
         pause_auto()
     elif argv[0] == "resume-auto":
@@ -986,16 +1127,20 @@ def main():
     claude_bit = f"{circ} {'·'.join(shown)}" if shown else circ
     # both agents share one title line so neither is hidden behind a cycle
     codex_bit = f"  {CODEX_MARK} {max(codex_pcts):.0f}%" if codex_pcts else ""
-    print(f"{prefix}{claude_bit}{codex_bit} | image={ICON}")
     today = stats.get("today")
     block = stats.get("block")
     codex_today = ((stats.get("codex_spend") or {}).get("today") or {}).get("cost") or 0
+    # the pet reacts to whichever agent is closest to its wall
+    busy = bool((block or {}).get("perHour")) or codex_today > 0
+    mood = pet_mood(worst, busy, bool((codex_usage or {}).get("limit_reached")))
+    icon = pet_icon(mood) or ICON
+    print(f"{prefix}{claude_bit}{codex_bit} | image={icon}")
     if today or codex_today:
         # second title line -> SwiftBar cycles them (usage <-> live spend)
         spend = f"${(today or {}).get('cost', 0) + codex_today:,.0f} today"
         if block and block.get("perHour"):
             spend += f" · ${block['perHour']:,.0f}/hr"
-        print(f"{prefix}{spend} | image={ICON}")
+        print(f"{prefix}{spend} | image={icon}")
     print("---")
 
     # ---- accounts ----
@@ -1056,6 +1201,11 @@ def main():
         else:
             note = "credits: none (plan allowance only)"
         print(f"   {note} | size=11 color={GRAY} trim=false")
+        if icon is not ICON:
+            print(
+                f"   {PET_LABEL} · {PET_CAPTIONS.get(mood, mood)} | image={icon} "
+                f"size=11 color={GRAY} trim=false"
+            )
         if stats.get("codex_error"):
             print(
                 f"   ⚠ refresh failed ({stats['codex_error']}) · showing the reading from "
@@ -1198,6 +1348,8 @@ def main():
 
     # ---- actions ----
     print("---")
+    pet_label = "Show the Codex pet" if os.path.exists(HIDE_PET_FLAG) else "Hide the Codex pet"
+    print(f"{pet_label} | bash={PLUGIN} param1=toggle-pet terminal=false refresh=true")
     toggle_label = "Show emails" if hidden else "Hide emails"
     print(
         f"{toggle_label} | bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"
