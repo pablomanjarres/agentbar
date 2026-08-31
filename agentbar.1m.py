@@ -108,6 +108,9 @@ PET_MOODS = {
     "strained": (5, 0),
     "spent": (5, 2),
 }
+# Gap between the Claude glyph and the pet, in the 144 dpi pixel space both
+# are drawn in, so the pair reads as one item rather than two.
+PET_GAP_PX = 5
 PET_CAPTIONS = {
     "calm": "plenty of headroom",
     "working": "on the clock",
@@ -733,6 +736,51 @@ def pet_icon(mood):
     return data
 
 
+def title_icon(mood):
+    """Both marks in one image: the Claude glyph, then the pet.
+
+    SwiftBar allows one image per line, and dropping the Claude glyph for the
+    pet quietly removed the only sign that this item tracks Claude at all. They
+    are composited instead, at the same 36px/144 dpi as ICON so the pair keeps
+    the height a menu bar item is allowed.
+
+    Falls back to the bare glyph whenever the pet cannot be drawn, which is the
+    behaviour every other pet path already has.
+    """
+    pet = pet_icon(mood)
+    if not pet:
+        return ICON
+    cached = os.path.join(PET_DIR, f"title-{PET_NAME}-{mood}-v{PET_CACHE_VERSION}.b64")
+    try:
+        with open(cached) as f:
+            return f.read()
+    except OSError:
+        pass
+    try:
+        from PIL import Image
+
+        left = Image.open(io.BytesIO(base64.b64decode(ICON))).convert("RGBA")
+        right = Image.open(io.BytesIO(base64.b64decode(pet))).convert("RGBA")
+        height = max(left.height, right.height)
+        out = Image.new("RGBA", (left.width + PET_GAP_PX + right.width, height), (0, 0, 0, 0))
+        out.alpha_composite(left, (0, height - left.height))
+        out.alpha_composite(right, (left.width + PET_GAP_PX, height - right.height))
+        buf = io.BytesIO()
+        out.save(buf, format="PNG", optimize=True, dpi=(144, 144))
+        data = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ICON
+    try:
+        os.makedirs(PET_DIR, exist_ok=True)
+        tmp = cached + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, cached)
+    except OSError:
+        pass
+    return data
+
+
 def pet_mood(worst, busy, limit_reached):
     """Which frame the pet wears, from how close either agent is to its wall."""
     if limit_reached or worst >= 95:
@@ -1219,7 +1267,7 @@ def main():
     busy = bool((block or {}).get("perHour")) or codex_today > 0
     hit_limit = bool((codex_usage or {}).get("limit_reached")) and bool(codex_wins)
     mood = pet_mood(worst, busy, hit_limit)
-    icon = pet_icon(mood) or ICON
+    icon = title_icon(mood)
     # ONE title line. SwiftBar cycles multiple title lines in the bar but also
     # repeats every one of them at the top of the dropdown, so a second line
     # showed the icon and its text twice over. Spend rides along here instead,
