@@ -60,6 +60,16 @@ def test_cost(ab):
         prices,
     )
     assert abs(allcached - 0.5) < 1e-9, allcached
+
+    # gpt-5.6-sol is what Codex defaults to since 0.151; 1M fresh in + 100k out
+    # at 4.00 / 0.40 / 20.00 is 4 + 2.
+    sol = ab.codex_cost(
+        "gpt-5.6-sol",
+        {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 100_000},
+        prices,
+    )
+    assert sol is not None, "gpt-5.6-sol has no price"
+    assert abs(sol - 6.0) < 1e-9, sol
     print("ok   cached input billed as a slice, unpriced models return None")
 
 
@@ -96,6 +106,60 @@ def test_rollout_deltas(ab):
     )
     assert summed == final, f"delta sum {summed:,} != final cumulative {final:,}"
     print(f"ok   delta walk matches final cumulative exactly ({final:,} tokens)")
+
+
+def test_history_imports_are_not_usage(ab):
+    """Codex Desktop's imported legacy threads are not API usage.
+
+    Each carries a single token_count with only total_tokens set: no input, no
+    output, and no turn_context, so there is no model to attribute it to. They
+    used to land in an "unknown" bucket and trip the unpriced warning for spend
+    that never happened.
+    """
+    import json
+    import tempfile
+
+    stamp = "2026-09-01T12:00:00.000Z"
+    usage = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 640274,
+    }
+    rows = [
+        {
+            "timestamp": stamp,
+            "type": "session_meta",
+            "payload": {"id": "x", "history_mode": "legacy", "cli_version": "0.151.0-alpha.7.2"},
+        },
+        {
+            "timestamp": stamp,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": usage}},
+        },
+    ]
+
+    def parse(rows):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        try:
+            return ab.parse_rollout(fh.name)
+        finally:
+            os.unlink(fh.name)
+
+    assert parse(rows) == {}, parse(rows)
+
+    # the same shape with a real turn behind it still counts, under that model
+    rows.insert(1, {"timestamp": stamp, "type": "turn_context", "payload": {"model": "gpt-5.6-sol"}})
+    usage.update({"input_tokens": 600_000, "output_tokens": 40_274})
+    days = parse(rows)
+    assert list(days) == ["2026-09-01"], days
+    assert list(days["2026-09-01"]) == ["gpt-5.6-sol"], days
+    assert days["2026-09-01"]["gpt-5.6-sol"]["total_tokens"] == 640274
+    print("ok   imported legacy threads are skipped, real turns still counted")
 
 
 def test_scan_cache(ab):
@@ -216,6 +280,7 @@ def main():
     test_fetch_guards_shape_drift(ab)
     test_fresh_windows(ab)
     test_rollout_deltas(ab)
+    test_history_imports_are_not_usage(ab)
     test_scan_cache(ab)
     if "--live" in sys.argv:
         test_live(ab)

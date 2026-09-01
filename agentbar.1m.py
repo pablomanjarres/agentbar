@@ -69,7 +69,7 @@ CODEX_SCAN_PATH = os.path.join(CACHE_DIR, "codex-scan.json")
 # cache is keyed on each transcript's (mtime, size), which do NOT change when
 # the parser does, so without this an upgrade would serve the old numbers for
 # every already-seen session, forever.
-CODEX_SCAN_VERSION = 1
+CODEX_SCAN_VERSION = 2
 CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
 CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
 # Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
@@ -341,6 +341,7 @@ def minor_to_usd(obj):
 # aggregators that quote one are copying the parent gpt-5.3-codex row. It shows
 # up in the unpriced warning row instead, the same way ccusage gaps do.
 DEFAULT_CODEX_PRICES = {
+    "gpt-5.6-sol": {"in": 4.00, "cached": 0.40, "out": 20.00},
     "gpt-5.5": {"in": 5.00, "cached": 0.50, "out": 30.00},
     "gpt-5.4": {"in": 2.50, "cached": 0.25, "out": 15.00},
     "gpt-5.4-mini": {"in": 0.75, "cached": 0.075, "out": 4.50},
@@ -521,6 +522,13 @@ def parse_rollout(path):
             delta = {k: max(0, cur[k] - prev[k]) for k in TOKEN_FIELDS}
             prev = cur
             if delta["total_tokens"] <= 0:
+                continue
+            if not (delta["input_tokens"] or delta["output_tokens"]):
+                # Codex Desktop's imported legacy threads carry one token_count
+                # with only total_tokens filled in: no input, no output, and no
+                # turn_context to name a model. Nothing was billed, so counting
+                # it would only feed an "unknown" bucket and a false unpriced
+                # warning. A real turn always moves input or output.
                 continue
             try:
                 day = (

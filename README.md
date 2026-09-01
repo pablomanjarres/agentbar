@@ -84,7 +84,7 @@ Each lane is independent. Codex works with only `codex login` done, Claude works
 **Codex prices.** Rates ship in `DEFAULT_CODEX_PRICES` and are overridden per model, without editing the plugin, from `~/.config/agentbar/codex-prices.json`. Values are USD per 1M tokens, where `cached` prices the `cached_input_tokens` slice *of* `input_tokens` rather than an extra charge on top:
 
 ```json
-{ "gpt-5.6": { "in": 5.00, "cached": 0.50, "out": 30.00 } }
+{ "gpt-5.6-terra": { "in": 2.00, "cached": 0.20, "out": 12.00 } }
 ```
 
 A model that burns tokens with no price shows up as a warning row rather than quietly reading as $0. Bump `CODEX_SCAN_VERSION` if you change the parser, so cached scans get re-read.
