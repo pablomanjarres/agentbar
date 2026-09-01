@@ -166,7 +166,10 @@ def load_json(path):
 
 
 def atomic_write(path, obj):
-    tmp = path + ".tmp"
+    # pid-scoped: the menu's actions run refresh_stats in a second process while
+    # the 1m tick may be mid-write, and a shared ".tmp" name let one rename the
+    # other's file away (FileNotFoundError on os.replace, blank menu that tick).
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f)
     os.replace(tmp, path)
