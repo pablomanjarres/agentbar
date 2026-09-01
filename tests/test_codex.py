@@ -8,6 +8,7 @@ adds one call to the ChatGPT usage endpoint.
 import importlib.util
 import os
 import sys
+import tempfile
 import time
 
 PLUGIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agentbar.1m.py")
@@ -17,6 +18,14 @@ def load():
     spec = importlib.util.spec_from_file_location("agentbar", PLUGIN)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # the scan cache is versioned: reading the real one from a branch with a
+    # newer parser would make the tests and the installed plugin rewrite it
+    # in turns, so every cache path points at a scratch dir
+    mod.CACHE_DIR = tempfile.mkdtemp(prefix="agentbar-test-")
+    mod.STATS_PATH = os.path.join(mod.CACHE_DIR, "stats.json")
+    mod.LEDGER_PATH = os.path.join(mod.CACHE_DIR, "cost-ledger.json")
+    mod.CODEX_SCAN_PATH = os.path.join(mod.CACHE_DIR, "codex-scan.json")
+    mod.CLAUDE_SETTINGS = os.path.join(mod.CACHE_DIR, "settings.json")
     return mod
 
 
@@ -156,9 +165,13 @@ def test_history_imports_are_not_usage(ab):
     rows.insert(1, {"timestamp": stamp, "type": "turn_context", "payload": {"model": "gpt-5.6-sol"}})
     usage.update({"input_tokens": 600_000, "output_tokens": 40_274})
     days = parse(rows)
-    assert list(days) == ["2026-09-01"], days
-    assert list(days["2026-09-01"]) == ["gpt-5.6-sol"], days
-    assert days["2026-09-01"]["gpt-5.6-sol"]["total_tokens"] == 640274
+    # buckets are local days, and UTC noon is tomorrow from UTC+12 on
+    import datetime
+
+    local = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone().date().isoformat()
+    assert list(days) == [local], days
+    assert list(days[local]) == ["gpt-5.6-sol"], days
+    assert days[local]["gpt-5.6-sol"]["total_tokens"] == 640274
     print("ok   imported legacy threads are skipped, real turns still counted")
 
 
