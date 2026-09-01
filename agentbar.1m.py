@@ -422,6 +422,8 @@ def minor_to_usd(obj):
 # up in the unpriced warning row instead, the same way ccusage gaps do.
 DEFAULT_CODEX_PRICES = {
     "gpt-5.6-sol": {"in": 4.00, "cached": 0.40, "out": 20.00},
+    "gpt-5.6-terra": {"in": 2.00, "cached": 0.20, "out": 12.00},
+    "gpt-5.6-luna": {"in": 0.20, "cached": 0.02, "out": 1.20},
     "gpt-5.5": {"in": 5.00, "cached": 0.50, "out": 30.00},
     "gpt-5.4": {"in": 2.50, "cached": 0.25, "out": 15.00},
     "gpt-5.4-mini": {"in": 0.75, "cached": 0.075, "out": 4.50},
