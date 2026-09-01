@@ -163,13 +163,25 @@ def load_json(path):
 
 
 def atomic_write(path, obj):
+    atomic_write_text(path, json.dumps(obj))
+
+
+def atomic_write_text(path, text):
     # pid-scoped: the menu's actions run refresh_stats in a second process while
     # the 1m tick may be mid-write, and a shared ".tmp" name let one rename the
     # other's file away (FileNotFoundError on os.replace, blank menu that tick).
+    # A failed write takes its tmp with it; only a kill mid-write leaves one.
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def ccusage(args):
@@ -803,10 +815,7 @@ def pet_icon(mood):
         return None
     try:
         os.makedirs(PET_DIR, exist_ok=True)
-        tmp = cached + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(data)
-        os.replace(tmp, cached)
+        atomic_write_text(cached, data)
     except OSError:
         pass
     return data
@@ -857,10 +866,7 @@ def title_icon(mood):
         return ICON
     try:
         os.makedirs(PET_DIR, exist_ok=True)
-        tmp = cached + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(data)
-        os.replace(tmp, cached)
+        atomic_write_text(cached, data)
     except OSError:
         pass
     return data
