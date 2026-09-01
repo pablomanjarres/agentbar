@@ -30,6 +30,7 @@ def load(tmp, *, cswap=True, codex=True, partial_windows=False, stale=False):
     ab.TUI_CMD = os.path.join(ab.CACHE_DIR, "tui.command")
     ab.SECRETS_DIR = os.path.join(tmp, "secrets")
     ab.ADMIN_KEY_PATH = os.path.join(ab.SECRETS_DIR, "none")
+    ab.CLAUDE_SETTINGS = os.path.join(tmp, "settings.json")
     ab.HIDE_EMAILS_FLAG = os.path.join(ab.CACHE_DIR, "hide")
     ab.PAUSE_FLAG = os.path.join(ab.CACHE_DIR, "paused")
     ab.CSWAP_ROOT = os.path.join(tmp, "cswap") if cswap else os.path.join(tmp, "gone")
@@ -119,39 +120,51 @@ def test_claude_lane_is_claude_only():
     # a day past the re-seed floor whose transcripts are half cleaned up: ccusage
     # still sees a sliver of it, and that sliver must not replace the mark
     old = (datetime.date.today() - datetime.timedelta(days=32)).isoformat()
+    # a recent day with Codex spend and no Claude at all: the combined command
+    # wrote a mark for it, `ccusage claude daily` has no row for it
+    codex_day = (datetime.date.today() - datetime.timedelta(days=5)).isoformat()
     with tempfile.TemporaryDirectory() as tmp:
         ab = load(tmp)
         calls = []
         row = {"date": today, "totalCost": 7.0, "totalTokens": 100, "modelBreakdowns": []}
         sliver = {"date": old, "totalCost": 0.83, "totalTokens": 10, "modelBreakdowns": []}
+        daily = []
 
         def fake(args):
             calls.append(list(args))
-            return {"daily": [sliver, row]} if args[-1] == "daily" else {"blocks": []}
+            return {"daily": list(daily)} if args[-1] == "daily" else {"blocks": []}
 
         ab.ccusage = fake
         # a ledger written by the combined command: today inflated by Codex, an
-        # older day ccusage can no longer see at all, and the half-cleaned day
+        # older day ccusage can no longer see at all, the half-cleaned day, and
+        # the Codex-only day
         os.makedirs(ab.CACHE_DIR, exist_ok=True)
+        marks = {
+            today: {"cost": 20.0, "tokens": 300},
+            "2026-01-05": {"cost": 5.0, "tokens": 50},
+            old: {"cost": 32.5, "tokens": 900},
+            codex_day: {"cost": 12.0, "tokens": 200},
+        }
         with open(ab.LEDGER_PATH, "w") as f:
-            json.dump(
-                {
-                    today: {"cost": 20.0, "tokens": 300},
-                    "2026-01-05": {"cost": 5.0, "tokens": 50},
-                    old: {"cost": 32.5, "tokens": 900},
-                },
-                f,
-            )
+            json.dump(marks, f)
 
+        # an empty read (unmounted transcripts, say) must not spend the re-seed
         st = ab.refresh_stats(force=True)
         assert ["claude", "daily"] in calls and ["claude", "blocks"] in calls, calls
         assert all(c[0] == "claude" for c in calls), calls
+        assert st.get("ledgerAgent") != "claude", "empty read consumed the re-seed"
+        with open(ab.LEDGER_PATH) as f:
+            assert json.load(f) == marks, "empty read touched the ledger"
+
+        daily[:] = [sliver, row]
+        st = ab.refresh_stats(force=True)
         assert st["today"] == {"cost": 7.0, "tokens": 100}, st["today"]
         with open(ab.LEDGER_PATH) as f:
             led = json.load(f)
         assert led[today] == {"cost": 7.0, "tokens": 100}, "inflated mark not re-seeded"
         assert led["2026-01-05"] == {"cost": 5.0, "tokens": 50}, "unseen day was lost"
         assert led[old] == {"cost": 32.5, "tokens": 900}, "half-cleaned day re-seeded too low"
+        assert codex_day not in led, "Codex-only day kept its mark"
 
         # re-seeding is a one-time move: after it, a dip is absorbed again
         row["totalCost"] = 6.0

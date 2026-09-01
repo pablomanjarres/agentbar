@@ -63,7 +63,7 @@ Python 3 stdlib only, no pip installs · SwiftBar · ccusage (Claude spend) · c
 
 ```bash
 brew install --cask swiftbar          # if you do not have it
-npm install -g ccusage                # powers the Claude spend lane
+npm install -g ccusage                # powers the Claude spend lane (17+ for `ccusage claude`)
 
 git clone https://github.com/pablomanjarres/agentbar
 ln -s "$PWD/agentbar/agentbar.1m.py" ~/.swiftbar/agentbar.1m.py
