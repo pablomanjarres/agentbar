@@ -9,6 +9,7 @@ import contextlib
 import datetime
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
@@ -108,6 +109,59 @@ def render(ab):
     return buf.getvalue()
 
 
+def test_claude_lane_is_claude_only():
+    """ccusage 20 scans every agent it finds, Codex included, and its combined
+    `daily` keys the day as `period`. The Claude lane must ask for Claude alone
+    (`ccusage claude daily`, keyed `date`), or Codex spend lands on both sides
+    of the menu and, through max(), in the ledger for good.
+    """
+    today = datetime.date.today().isoformat()
+    # a day past the re-seed floor whose transcripts are half cleaned up: ccusage
+    # still sees a sliver of it, and that sliver must not replace the mark
+    old = (datetime.date.today() - datetime.timedelta(days=32)).isoformat()
+    with tempfile.TemporaryDirectory() as tmp:
+        ab = load(tmp)
+        calls = []
+        row = {"date": today, "totalCost": 7.0, "totalTokens": 100, "modelBreakdowns": []}
+        sliver = {"date": old, "totalCost": 0.83, "totalTokens": 10, "modelBreakdowns": []}
+
+        def fake(args):
+            calls.append(list(args))
+            return {"daily": [sliver, row]} if args[-1] == "daily" else {"blocks": []}
+
+        ab.ccusage = fake
+        # a ledger written by the combined command: today inflated by Codex, an
+        # older day ccusage can no longer see at all, and the half-cleaned day
+        os.makedirs(ab.CACHE_DIR, exist_ok=True)
+        with open(ab.LEDGER_PATH, "w") as f:
+            json.dump(
+                {
+                    today: {"cost": 20.0, "tokens": 300},
+                    "2026-01-05": {"cost": 5.0, "tokens": 50},
+                    old: {"cost": 32.5, "tokens": 900},
+                },
+                f,
+            )
+
+        st = ab.refresh_stats(force=True)
+        assert ["claude", "daily"] in calls and ["claude", "blocks"] in calls, calls
+        assert all(c[0] == "claude" for c in calls), calls
+        assert st["today"] == {"cost": 7.0, "tokens": 100}, st["today"]
+        with open(ab.LEDGER_PATH) as f:
+            led = json.load(f)
+        assert led[today] == {"cost": 7.0, "tokens": 100}, "inflated mark not re-seeded"
+        assert led["2026-01-05"] == {"cost": 5.0, "tokens": 50}, "unseen day was lost"
+        assert led[old] == {"cost": 32.5, "tokens": 900}, "half-cleaned day re-seeded too low"
+
+        # re-seeding is a one-time move: after it, a dip is absorbed again
+        row["totalCost"] = 6.0
+        ab.refresh_stats(force=True)
+        with open(ab.LEDGER_PATH) as f:
+            led = json.load(f)
+        assert led[today]["cost"] == 7.0, "high-water mark not restored after reseed"
+    print("ok   Claude lane asks ccusage for Claude alone, ledger re-seeded once")
+
+
 def test_codex_only():
     with tempfile.TemporaryDirectory() as tmp:
         out = render(load(tmp, cswap=False, codex=True))
@@ -184,6 +238,7 @@ def test_stale_claude_windows():
 
 
 if __name__ == "__main__":
+    test_claude_lane_is_claude_only()
     test_codex_only()
     test_claude_only()
     test_neither()
