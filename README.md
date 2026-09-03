@@ -63,7 +63,7 @@ Python 3 stdlib only, no pip installs · SwiftBar · ccusage (Claude spend) · c
 
 ```bash
 brew install --cask swiftbar          # if you do not have it
-npm install -g ccusage                # powers the Claude spend lane
+npm install -g ccusage                # powers the Claude spend lane (17+ for `ccusage claude`)
 
 git clone https://github.com/pablomanjarres/agentbar
 ln -s "$PWD/agentbar/agentbar.1m.py" ~/.swiftbar/agentbar.1m.py
@@ -84,7 +84,7 @@ Each lane is independent. Codex works with only `codex login` done, Claude works
 **Codex prices.** Rates ship in `DEFAULT_CODEX_PRICES` and are overridden per model, without editing the plugin, from `~/.config/agentbar/codex-prices.json`. Values are USD per 1M tokens, where `cached` prices the `cached_input_tokens` slice *of* `input_tokens` rather than an extra charge on top:
 
 ```json
-{ "gpt-5.6": { "in": 5.00, "cached": 0.50, "out": 30.00 } }
+{ "gpt-5.7": { "in": 5.00, "cached": 0.50, "out": 30.00 } }
 ```
 
 A model that burns tokens with no price shows up as a warning row rather than quietly reading as $0. Bump `CODEX_SCAN_VERSION` if you change the parser, so cached scans get re-read.

@@ -7,7 +7,9 @@ is gone, and what the tokens would have cost at API rates.
 Claude data sources (all local):
   - ~/.claude-swap-backup/sequence.json + cache/usage.json  (written by the
     `cswap auto` daemon every 60-90s; read here, never fetched)
-  - ccusage (npm) over ~/.claude/projects JSONL transcripts, --offline pricing
+  - ccusage (npm) over ~/.claude/projects JSONL transcripts, --offline pricing,
+    asked for Claude alone: ccusage 20 otherwise folds every agent it finds,
+    Codex included, into the same row
 
 Codex data sources:
   - ~/.codex/sessions/**/rollout-*.jsonl for token usage, differenced per
@@ -44,6 +46,8 @@ CSWAP_ROOT = os.path.join(HOME, ".claude-swap-backup")
 CACHE_DIR = os.path.join(HOME, ".swiftbar", ".cache")
 STATS_PATH = os.path.join(CACHE_DIR, "stats.json")
 LEDGER_PATH = os.path.join(CACHE_DIR, "cost-ledger.json")
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+RESEED_MARGIN_DAYS = 2  # see reseed_floor()
 TUI_CMD = os.path.join(CACHE_DIR, "cswap-tui.command")
 AUTO_LOG = os.path.join(HOME, "Library/Logs/claude-swap-auto.log")
 CSWAP = os.path.join(HOME, ".local/bin/cswap")
@@ -69,7 +73,7 @@ CODEX_SCAN_PATH = os.path.join(CACHE_DIR, "codex-scan.json")
 # cache is keyed on each transcript's (mtime, size), which do NOT change when
 # the parser does, so without this an upgrade would serve the old numbers for
 # every already-seen session, forever.
-CODEX_SCAN_VERSION = 1
+CODEX_SCAN_VERSION = 2
 CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
 CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
 # Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
@@ -159,10 +163,25 @@ def load_json(path):
 
 
 def atomic_write(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f)
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(obj))
+
+
+def atomic_write_text(path, text):
+    # pid-scoped: the menu's actions run refresh_stats in a second process while
+    # the 1m tick may be mid-write, and a shared ".tmp" name let one rename the
+    # other's file away (FileNotFoundError on os.replace, blank menu that tick).
+    # A failed write takes its tmp with it; only a kill mid-write leaves one.
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def ccusage(args):
@@ -170,7 +189,52 @@ def ccusage(args):
     return json.loads(out) if out else None
 
 
-def update_ledger(rows):
+def ccusage_claude(args):
+    """`ccusage claude <cmd>`: Claude alone.
+
+    ccusage before 17 has no per-agent commands, and there the combined command
+    is Claude alone anyway, so fall back to it. Rows that name another agent
+    are dropped on that path: a ccusage 20 whose scoped call failed for some
+    other reason must not fold Codex back into the ledger through max().
+    """
+    out = ccusage(["claude"] + args)
+    if out is not None:
+        return out
+    out = ccusage(args)
+    if out and isinstance(out.get("daily"), list):
+        out["daily"] = [
+            r
+            for r in out["daily"]
+            if set((r.get("metadata") or {}).get("agents") or ["claude"]) == {"claude"}
+        ]
+    return out
+
+
+def row_day(row):
+    """The day a ccusage row is for: `date` from the per-agent commands
+    (`ccusage claude daily`), `period` from the combined `ccusage daily` that
+    ccusage_claude() falls back to on versions without per-agent commands."""
+    return row.get("date") or row.get("period")
+
+
+def reseed_floor():
+    """First day a ledger re-seed may overwrite.
+
+    Inside Claude Code's transcript cleanup (cleanupPeriodDays, default 30),
+    with margin: a day being cleaned up reads too LOW, the one direction the
+    high-water mark cannot recover from. Verified on a real ledger: without
+    the floor, a 32-day-old $32.50 would have been re-seeded to $0.83.
+    """
+    keep = (load_json(CLAUDE_SETTINGS) or {}).get("cleanupPeriodDays")
+    try:
+        keep = int(keep)
+    except (TypeError, ValueError):
+        keep = 30
+    days = max(keep - RESEED_MARGIN_DAYS, 0)
+    return (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+
+
+def update_ledger(rows, reseed=False):
     """Per-day high-water mark of cost + tokens. Returns the whole ledger.
 
     ccusage keeps no store of its own: every total is recomputed from the JSONL
@@ -183,16 +247,32 @@ def update_ledger(rows):
     Days deleted before this ledger existed are gone for good; it protects from
     here on. "Rebuild ledger" in the menu re-seeds it from what ccusage can still
     see (use only if a day is ever recorded too high).
+
+    reseed=True takes ccusage's figure as-is for every day it can still see,
+    from reseed_floor() on, and keeps older days untouched. Used once, when the
+    source moved to Claude-only: the combined command had folded Codex spend
+    into the marks, and max() would have kept the inflated ones forever. A day
+    inside the window with no Claude row had no Claude spend, so its mark (Codex
+    alone) goes. An empty read re-seeds nothing.
     """
     led = load_json(LEDGER_PATH) or {}
     changed = False
-    for r in rows or []:
-        day = r.get("period")
-        if not day:
-            continue
+    rows = [r for r in rows or [] if row_day(r)]
+    reseed = reseed and bool(rows)
+    if reseed:
+        floor = reseed_floor()
+        seen = {row_day(r) for r in rows}
+        for day in [d for d in led if d >= floor and d not in seen]:
+            del led[day]
+            changed = True
+    for r in rows:
+        day = row_day(r)
         prev = led.get(day) or {}
-        cost = max(r.get("totalCost") or 0, prev.get("cost") or 0)
-        tokens = max(r.get("totalTokens") or 0, prev.get("tokens") or 0)
+        cost = r.get("totalCost") or 0
+        tokens = r.get("totalTokens") or 0
+        if not reseed or day < floor:
+            cost = max(cost, prev.get("cost") or 0)
+            tokens = max(tokens, prev.get("tokens") or 0)
         if cost != prev.get("cost") or tokens != prev.get("tokens"):
             led[day] = {"cost": cost, "tokens": tokens}
             changed = True
@@ -341,6 +421,9 @@ def minor_to_usd(obj):
 # aggregators that quote one are copying the parent gpt-5.3-codex row. It shows
 # up in the unpriced warning row instead, the same way ccusage gaps do.
 DEFAULT_CODEX_PRICES = {
+    "gpt-5.6-sol": {"in": 4.00, "cached": 0.40, "out": 20.00},
+    "gpt-5.6-terra": {"in": 2.00, "cached": 0.20, "out": 12.00},
+    "gpt-5.6-luna": {"in": 0.20, "cached": 0.02, "out": 1.20},
     "gpt-5.5": {"in": 5.00, "cached": 0.50, "out": 30.00},
     "gpt-5.4": {"in": 2.50, "cached": 0.25, "out": 15.00},
     "gpt-5.4-mini": {"in": 0.75, "cached": 0.075, "out": 4.50},
@@ -521,6 +604,13 @@ def parse_rollout(path):
             delta = {k: max(0, cur[k] - prev[k]) for k in TOKEN_FIELDS}
             prev = cur
             if delta["total_tokens"] <= 0:
+                continue
+            if not (delta["input_tokens"] or delta["output_tokens"]):
+                # Codex Desktop's imported legacy threads carry one token_count
+                # with only total_tokens filled in: no input, no output, and no
+                # turn_context to name a model. Nothing was billed, so counting
+                # it would only feed an "unknown" bucket and a false unpriced
+                # warning. A real turn always moves input or output.
                 continue
             try:
                 day = (
@@ -727,10 +817,7 @@ def pet_icon(mood):
         return None
     try:
         os.makedirs(PET_DIR, exist_ok=True)
-        tmp = cached + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(data)
-        os.replace(tmp, cached)
+        atomic_write_text(cached, data)
     except OSError:
         pass
     return data
@@ -781,10 +868,7 @@ def title_icon(mood):
         return ICON
     try:
         os.makedirs(PET_DIR, exist_ok=True)
-        tmp = cached + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(data)
-        os.replace(tmp, cached)
+        atomic_write_text(cached, data)
     except OSError:
         pass
     return data
@@ -806,10 +890,14 @@ def refresh_stats(force=False, active_num=None):
     changed = False
 
     if force or now - st.get("fastAt", 0) > FAST_TTL:
-        daily = ccusage(["daily"])
+        # ccusage 20 scans every agent it can find and folds them into one row,
+        # Codex included. This lane is Claude's; Codex is walked separately
+        # below, so the combined command counted it on both sides of the menu.
+        daily = ccusage_claude(["daily"])
         if daily:
             today = datetime.date.today().isoformat()
-            row = next((r for r in daily.get("daily", []) if r.get("period") == today), None)
+            rows = daily.get("daily") or []
+            row = next((r for r in rows if row_day(r) == today), None)
             st["today"] = {
                 "cost": row.get("totalCost", 0) if row else 0,
                 "tokens": row.get("totalTokens", 0) if row else 0,
@@ -818,7 +906,11 @@ def refresh_stats(force=False, active_num=None):
             # Month + Total come from the ledger, not from ccusage's live totals:
             # ccusage only sees transcripts that still exist, so its figures shrink
             # as Claude Code's 30-day cleanup eats history. See update_ledger().
-            led = update_ledger(daily.get("daily", []))
+            # The first Claude-only pass re-seeds the days ccusage still sees, so
+            # marks that had Codex folded in come back down once.
+            led = update_ledger(rows, reseed=st.get("ledgerAgent") != "claude")
+            if rows:  # an empty read must not spend the one-time re-seed
+                st["ledgerAgent"] = "claude"
             st["alltime"] = {
                 "cost": sum(v.get("cost") or 0 for v in led.values()),
                 "tokens": sum(v.get("tokens") or 0 for v in led.values()),
@@ -835,7 +927,7 @@ def refresh_stats(force=False, active_num=None):
         # rides the fast lane with ccusage rather than the network lane below.
         st["codex_spend"] = codex_summary()
         changed = True
-        blocks = ccusage(["blocks"])
+        blocks = ccusage_claude(["blocks"])
         if blocks:
             act = next((b for b in blocks.get("blocks", []) if b.get("isActive")), None)
             if act:
