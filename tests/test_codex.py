@@ -79,6 +79,15 @@ def test_cost(ab):
     )
     assert sol is not None, "gpt-5.6-sol has no price"
     assert abs(sol - 6.0) < 1e-9, sol
+
+    # 1M input, half cached, and 100k output at Astra's 10 / 1 / 50 rates.
+    astra = ab.codex_cost(
+        "gpt-6-astra",
+        {"input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000},
+        ab.DEFAULT_CODEX_PRICES,
+    )
+    assert astra is not None, "gpt-6-astra has no shipped price"
+    assert abs(astra - 10.5) < 1e-9, astra
     print("ok   cached input billed as a slice, unpriced models return None")
 
 
