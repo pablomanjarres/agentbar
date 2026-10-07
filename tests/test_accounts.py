@@ -51,7 +51,24 @@ def test_stale_summary():
     print("ok   stale summary never displays an expired percentage")
 
 
+def test_unmanaged_login():
+    with tempfile.TemporaryDirectory() as tmp:
+        ab = load(tmp, codex=False)
+        ab.daemon_running = lambda: True
+        ab.last_log_events = lambda: ({
+            "ts": "2026-10-07T23:47:18Z",
+            "event": "no-switch",
+            "reason": "unmanaged-active-account",
+        }, None)
+        output = render(ab)
+    assert "login not connected" in output, "unmanaged login shown as healthy running"
+    assert "← active" not in output, "saved account falsely labelled current"
+    assert "Auto-switch: running ·" not in output
+    print("ok   unregistered current login cannot appear healthy or active")
+
+
 if __name__ == "__main__":
     test_five_accounts()
     test_stale_summary()
+    test_unmanaged_login()
     print("\nall checks passed")
