@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Checks for the Codex lane. Run: python3 tests/test_codex.py [--live]
 
-The pure-arithmetic checks always run. The scan checks read whatever is in
-~/.codex and skip themselves when Codex was never used on this machine. --live
-adds one call to the ChatGPT usage endpoint.
+Arithmetic and scan-cache checks use controlled inputs. The rollout delta check
+reads ~/.codex and skips itself when no sessions exist. --live adds one call to
+the ChatGPT usage endpoint.
 """
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -215,19 +216,51 @@ def test_history_imports_are_not_usage(ab):
 
 
 def test_scan_cache(ab):
-    t0 = time.time()
-    first = ab.codex_summary()
-    cold = time.time() - t0
-    t0 = time.time()
-    second = ab.codex_summary()
-    warm = time.time() - t0
-    assert first == second, "cached scan disagreed with the cold scan"
-    for scope in ("today", "month", "alltime"):
-        assert first[scope]["cost"] >= 0
-        assert first[scope]["tokens"] >= 0
-    assert first["alltime"]["tokens"] >= first["month"]["tokens"] >= first["today"]["tokens"]
-    assert first["alltime"]["cost"] + 1e-9 >= first["month"]["cost"]
-    print(f"ok   scan cache is stable and consistent (cold {cold:.2f}s, warm {warm:.2f}s)")
+    """An unchanged transcript has the same exact totals on cold and warm scans."""
+    import datetime
+
+    original = (ab.CODEX_SESSIONS, ab.CACHE_DIR, ab.CODEX_SCAN_PATH, ab.CODEX_PRICES_PATH)
+    today = datetime.date.today().isoformat()
+    stamp = datetime.datetime.now().astimezone().isoformat()
+    rows = [
+        {"timestamp": stamp, "type": "session_meta", "payload": {"id": "cache-fixture"}},
+        {"timestamp": stamp, "type": "turn_context", "payload": {"model": "gpt-5.5"}},
+    ]
+    for usage in (
+        {"input_tokens": 500_000, "cached_input_tokens": 250_000, "output_tokens": 50_000, "total_tokens": 550_000},
+        {"input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000, "total_tokens": 1_100_000},
+    ):
+        rows.append({
+            "timestamp": stamp,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": usage}},
+        })
+    try:
+        with tempfile.TemporaryDirectory(prefix="agentbar-scan-test-") as scratch:
+            ab.CODEX_SESSIONS = os.path.join(scratch, "sessions")
+            ab.CACHE_DIR = os.path.join(scratch, "cache")
+            ab.CODEX_SCAN_PATH = os.path.join(ab.CACHE_DIR, "codex-scan.json")
+            ab.CODEX_PRICES_PATH = os.path.join(scratch, "prices.json")
+            os.makedirs(ab.CODEX_SESSIONS)
+            with open(os.path.join(ab.CODEX_SESSIONS, "rollout.jsonl"), "w") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+            first = ab.codex_summary()
+            cache_mtime = os.stat(ab.CODEX_SCAN_PATH).st_mtime_ns
+            second = ab.codex_summary()
+            assert first == second, "cached scan disagreed with the cold scan"
+            assert os.stat(ab.CODEX_SCAN_PATH).st_mtime_ns == cache_mtime
+            # The final cumulative reading, not the sum of both events, is billed.
+            assert first == {
+                "today": {"cost": 5.75, "tokens": 1_100_000},
+                "month": {"cost": 5.75, "tokens": 1_100_000},
+                "alltime": {"cost": 5.75, "tokens": 1_100_000, "days": 1},
+                "unpriced": [],
+                "last_day": today,
+            }, first
+    finally:
+        ab.CODEX_SESSIONS, ab.CACHE_DIR, ab.CODEX_SCAN_PATH, ab.CODEX_PRICES_PATH = original
+    print("ok   controlled transcript scan cache is stable with exact cumulative totals")
 
 
 def test_window_dedupe(ab):
