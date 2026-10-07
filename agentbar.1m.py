@@ -76,6 +76,7 @@ CODEX_SCAN_PATH = os.path.join(CACHE_DIR, "codex-scan.json")
 CODEX_SCAN_VERSION = 2
 CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
 CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
+ACCOUNT_SETUP_CMD = os.path.join(CONFIG_DIR, "account-setup", "setup.command")
 # Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
 # itself reads, and it only answers with the originator header set.
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -1635,6 +1636,11 @@ def main():
     if has_cswap:
         print(
             f"Open cswap dashboard (TUI) | bash=/usr/bin/open param1={TUI_CMD} terminal=false"
+        )
+    if os.path.isfile(ACCOUNT_SETUP_CMD):
+        print(
+            f"Connect Claude accounts | bash=/usr/bin/open "
+            f"param1={ACCOUNT_SETUP_CMD} terminal=false"
         )
     print(
         f"Open Codex usage settings | bash=/usr/bin/open "
