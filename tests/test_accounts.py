@@ -43,11 +43,19 @@ def test_five_accounts():
 
 def test_stale_summary():
     with tempfile.TemporaryDirectory() as tmp:
-        output = render(load(tmp, codex=False, stale=True))
+        ab = load(tmp, codex=False, stale=True)
+        path = os.path.join(ab.CSWAP_ROOT, "cache", "usage.json")
+        usage = ab.load_json(path)
+        usage["accounts"]["1"]["lastGood"]["scoped"] = [{"name": "Fable", "pct": 0}]
+        with open(path, "w") as f:
+            json.dump(usage, f)
+        output = render(ab)
     summary = output.split("---")[1].splitlines()[2]
     assert "5h stale" in summary and "7d stale" in summary, summary
     assert "40%" not in summary and "55%" not in summary, summary
     assert "stale reading" in output and "14d" in output
+    fable = next(line for line in output.splitlines() if "Fable" in line)
+    assert "stale reading" in fable, "undated model gauge from expired fetch looks live"
     print("ok   stale summary never displays an expired percentage")
 
 
