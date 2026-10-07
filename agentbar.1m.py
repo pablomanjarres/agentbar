@@ -1255,13 +1255,18 @@ def account_windows(lastgood):
     """Yield (label, window) for every rate-limit window an account has."""
     if not lastgood:
         return
+    standard = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         w = claude_window(lastgood.get(key))
         if w:
+            standard.append(w)
             yield label, w
     for scoped in lastgood.get("scoped") or []:
         w = claude_window(scoped)
         if w:
+            if not scoped.get("resets_at") and standard and all(v.get("stale") for v in standard):
+                w["stale"] = True
+                w["age"] = min(v.get("age") or 0 for v in standard)
             yield scoped.get("name", "model")[:5], w
 
 
