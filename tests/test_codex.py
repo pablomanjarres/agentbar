@@ -91,6 +91,36 @@ def test_cost(ab):
     print("ok   cached input billed as a slice, unpriced models return None")
 
 
+def test_new_model_prices(ab):
+    # Each mixed case has 0.5M fresh input, 0.5M cached input, and 0.1M output.
+    # Sol: 1 + .1 + 1 = 2.1; Sol 6.1: 1 + .05 + 1 = 2.05;
+    # Luna: .05 + .005 + .05 = .105. All-cached input isolates the cache rate.
+    cases = (
+        ("gpt-6-sol", 2.1, 0.20, 2.0, 1.0),
+        ("gpt-6.1-sol", 2.05, 0.10, 2.0, 1.0),
+        ("gpt-6-luna", 0.105, 0.01, 0.1, 0.05),
+    )
+    for model, mixed_expected, cached_expected, fresh_expected, output_expected in cases:
+        mixed = ab.codex_cost(
+            model,
+            {"input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000},
+            ab.DEFAULT_CODEX_PRICES,
+        )
+        assert mixed is not None, f"{model} has no shipped price"
+        assert abs(mixed - mixed_expected) < 1e-9, (model, mixed)
+        cached = ab.codex_cost(
+            model,
+            {"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000, "output_tokens": 0},
+            ab.DEFAULT_CODEX_PRICES,
+        )
+        assert abs(cached - cached_expected) < 1e-9, (model, cached)
+        fresh = ab.codex_cost(model, {"input_tokens": 1_000_000}, ab.DEFAULT_CODEX_PRICES)
+        assert abs(fresh - fresh_expected) < 1e-9, (model, fresh)
+        output = ab.codex_cost(model, {"output_tokens": 100_000}, ab.DEFAULT_CODEX_PRICES)
+        assert abs(output - output_expected) < 1e-9, (model, output)
+    print("ok   new model spend uses published fresh, cached and output rates")
+
+
 def test_rollout_deltas(ab):
     """The parser must reproduce a session's final cumulative reading exactly."""
     import glob
@@ -297,6 +327,7 @@ def main():
     ab = load()
     test_labels(ab)
     test_cost(ab)
+    test_new_model_prices(ab)
     test_window_dedupe(ab)
     test_distinct_models_survive(ab)
     test_fetch_guards_shape_drift(ab)
