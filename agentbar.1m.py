@@ -1341,6 +1341,9 @@ def print_daemon(daemon, hidden):
                 f"   {str((last or {}).get('message'))[:70]} | "
                 f"size=11 color={ORANGE} trim=false"
             )
+        elif (last or {}).get("reason") == "unmanaged-active-account":
+            print(f"Auto-switch: login not connected{detail} | color={ORANGE} size=12")
+            print(f"   Connect the current Claude login to enable switching | size=11 color={GRAY}")
         else:
             print(f"Auto-switch: running{detail} | color={GREEN} size=12")
         if last_switch:
@@ -1367,6 +1370,8 @@ def main():
     active = seq.get("activeAccountNumber")
     order = seq.get("sequence") or sorted(int(k) for k in accounts)
     daemon = daemon_running()
+    if daemon and (last_log_events()[0] or {}).get("reason") == "unmanaged-active-account":
+        active = None
     # Claude account gauges, the switcher and the daemon lane all come from
     # claude-swap. Codex-only users have none of it, and telling them a daemon
     # they never installed is down is a false alarm, so those lanes stay hidden.
