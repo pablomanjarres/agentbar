@@ -1053,7 +1053,7 @@ def win_label(minutes):
     return f"{minutes}m"
 
 
-def print_gauges(windows):
+def print_gauges(windows, prefix=""):
     """One bar row per rate-limit window. Shared by the Claude and Codex lanes.
 
     Codex labels are wider than Claude's ("5.3-Codex-Spark 5h"), so the column
@@ -1070,7 +1070,7 @@ def print_gauges(windows):
             # Say so in grey rather than drawing a reassuring green bar.
             age = f" · {human_dur(w['age'])} old" if w.get("age") else ""
             print(
-                f"   {label:<{pad}} {'·' * 10} stale reading{age} "
+                f"{prefix}   {label:<{pad}} {'·' * 10} stale reading{age} "
                 f"| font=Menlo size=11 trim=false color={GRAY}"
             )
             continue
@@ -1079,7 +1079,7 @@ def print_gauges(windows):
             f"   {label:<{pad}} {bar(pct)} {pct:>3.0f}% used · "
             f"{100 - pct:.0f}% left · {reset}"
         )
-        print(f"{line} | font=Menlo size=11 trim=false color={state_color(pct)}")
+        print(f"{prefix}{line} | font=Menlo size=11 trim=false color={state_color(pct)}")
 
 
 def print_rows(rows):
@@ -1262,6 +1262,50 @@ def account_windows(lastgood):
             yield scoped.get("name", "model")[:5], w
 
 
+def print_account(num, meta, usage, active, hidden):
+    """One summary row, with full usage and manual switching in its submenu."""
+    email = meta.get("email", f"account {num}")
+    token_account = email.endswith("@token.local")
+    lastgood = usage.get("lastGood") or {}
+    windows = list(account_windows(lastgood))
+    summary = []
+    for label, window in windows:
+        if label not in ("5h", "7d"):
+            continue
+        value = "stale" if window.get("stale") else f"{window['pct']:.0f}%"
+        summary.append(f"{label} {value}")
+    if token_account:
+        summary = ["manual"]
+    elif not summary:
+        summary = ["no usage"]
+    error = usage.get("lastError")
+    if error and not token_account:
+        summary.append(f"⚠ {str(error)[:24]}")
+    is_active = num == active
+    circ = CIRCLED[num - 1] if 1 <= num <= 10 else str(num)
+    marker = " ← active" if is_active else ""
+    color = RUST if is_active else ORANGE if error else GRAY
+    print(
+        f"{circ} {display_email(email, hidden)}{marker} · {' · '.join(summary)} "
+        f"| color={color} size=12"
+    )
+    if token_account:
+        print(f"--API billing · excluded from auto-switch | size=11 color={GRAY}")
+    elif windows:
+        print_gauges(windows, prefix="--")
+    else:
+        print(f"--No usage data yet | size=11 color={GRAY}")
+    if error:
+        print(f"--⚠ {str(error)[:60]} | size=11 color={ORANGE}")
+    if is_active:
+        print(f"--Current account | size=11 color={RUST}")
+    else:
+        print(
+            f"--Switch to this account | bash={PLUGIN} param1=switch "
+            f"param2={num} terminal=false refresh=true size=12"
+        )
+
+
 def print_daemon(daemon, hidden):
     """The claude-swap auto-switch lane. Only drawn when cswap is set up."""
     if auto_paused():
@@ -1389,33 +1433,7 @@ def main():
             f"Claude accounts · claude-swap not set up, gauges off | size=11 color={GRAY}"
         )
     for num in order:  # empty when claude-swap has no accounts
-        meta = accounts.get(str(num), {})
-        email = meta.get("email", f"account {num}")
-        is_active = num == active
-        u = usage.get(str(num), {})
-        lastgood = u.get("lastGood")
-        circn = CIRCLED[num - 1] if num <= 10 else str(num)
-        is_token_acct = email.endswith("@token.local")
-        marker = "  ← active" if is_active else ""
-        color = f" color={RUST}" if is_active else ""
-        print(f"{circn} {display_email(email, hidden)}{marker} |{color} size=13")
-        if is_token_acct:
-            print(
-                f"   API billing · excluded from auto-switch · manual only "
-                f"| size=11 color={GRAY} trim=false"
-            )
-        if lastgood:
-            print_gauges(account_windows(lastgood))
-            err = u.get("lastError")
-            if err:
-                print(f"   ⚠ {str(err)[:60]} | size=11 color={ORANGE} trim=false")
-        elif not is_token_acct:
-            print(f"   no usage data yet | size=11 color={GRAY} trim=false")
-        if not is_active:
-            print(
-                f"   ↳ switch to this account | bash={PLUGIN} param1=switch "
-                f"param2={num} terminal=false refresh=true size=11 trim=false"
-            )
+        print_account(num, accounts.get(str(num), {}), usage.get(str(num), {}), active, hidden)
 
     # ---- codex / chatgpt account ----
     print("---")
