@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <swiftbar.hideAbout>true</swiftbar.hideAbout>
+# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
+# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
+# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
+# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 """SwiftBar plugin: one menu bar item for Claude Code and OpenAI Codex.
 
 Both agents answer the same two questions: how much of the rate-limit window
