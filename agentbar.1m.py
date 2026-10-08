@@ -77,6 +77,7 @@ CODEX_SCAN_VERSION = 2
 CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
 CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
 ACCOUNT_SETUP_CMD = os.path.join(CONFIG_DIR, "account-setup", "setup.command")
+HIDDEN_ACCOUNTS_PATH = os.path.join(CONFIG_DIR, "hidden-accounts.json")
 # Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
 # itself reads, and it only answers with the originator header set.
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -1372,9 +1373,12 @@ def main():
     ensure_tui_command()
     seq = load_json(os.path.join(CSWAP_ROOT, "sequence.json")) or {}
     usage = (load_json(os.path.join(CSWAP_ROOT, "cache", "usage.json")) or {}).get("accounts", {})
-    accounts = seq.get("accounts", {})
+    excluded = {str(n) for n in (load_json(HIDDEN_ACCOUNTS_PATH) or {}).get("accounts", [])}
+    accounts = {n: meta for n, meta in seq.get("accounts", {}).items() if n not in excluded}
     active = seq.get("activeAccountNumber")
-    order = seq.get("sequence") or sorted(int(k) for k in accounts)
+    if str(active) not in accounts:
+        active = None
+    order = [n for n in (seq.get("sequence") or sorted(int(k) for k in accounts)) if str(n) in accounts]
     daemon = daemon_running()
     if daemon and (last_log_events()[0] or {}).get("reason") == "unmanaged-active-account":
         active = None

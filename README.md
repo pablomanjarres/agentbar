@@ -89,6 +89,12 @@ Each lane is independent. Codex works with only `codex login` done, Claude works
 
 A model that burns tokens with no price shows up as a warning row rather than quietly reading as $0. Bump `CODEX_SCAN_VERSION` if you change the parser, so cached scans get re-read.
 
+**Hidden accounts.** `~/.config/agentbar/hidden-accounts.json` can hide selected account slots from the menu without changing stored logins or auto-switch settings:
+
+```json
+{ "accounts": ["1"] }
+```
+
 **The pet (optional).** Seedy needs a local Codex install for the art and Pillow to crop it once per sprite version:
 
 ```bash
