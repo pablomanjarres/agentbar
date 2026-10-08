@@ -226,7 +226,7 @@ def test_partial_claude_windows():
     title = out.splitlines()[0]
     assert "40%" in title, title
     assert "·55%" not in title, title
-    assert "Claude Max accounts" in out, "menu body did not render"
+    assert "Claude accounts" in out, "menu body did not render"
     print("ok   half-reported Claude windows still render the title")
 
 
