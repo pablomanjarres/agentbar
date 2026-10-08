@@ -1381,63 +1381,61 @@ def print_account(num, meta, usage, active, hidden):
     if is_active:
         print(f"--Current account | size=11 color={RUST}")
     else:
-        print(
-            f"--Switch to this account | bash={PLUGIN} param1=switch "
-            f"param2={num} terminal=false refresh=true size=12"
-        )
+        print_actions([("Switch to this account", f"bash={PLUGIN} param1=switch param2={num} terminal=false refresh=true size=12")])
+
+
+def print_actions(actions, prefix="--"):
+    """Render action labels and their existing command attributes at one level."""
+    for label, attributes in actions:
+        print(f"{prefix}{label} | {attributes}")
 
 
 def print_daemon(daemon, hidden):
-    """The claude-swap auto-switch lane. Only drawn when cswap is set up."""
+    """One visible status row; controls and diagnostics stay in its submenu."""
+    details = []
     if auto_paused():
-        print(f"Auto-switch: PAUSED (you turned it off) | color={ORANGE} size=12")
-        print(
-            f"   stays on the current account until you resume | size=11 color={GRAY} trim=false"
-        )
-        print(
-            f"▶ Resume auto-switch | bash={PLUGIN} param1=resume-auto "
-            f"terminal=false refresh=true size=12 color={GREEN}"
-        )
+        status, color = "paused", ORANGE
+        details.append(("Stays on the current account until resumed", GRAY))
+        actions = [(
+            "Resume auto-switch",
+            f"bash={PLUGIN} param1=resume-auto terminal=false refresh=true size=12 color={GREEN}",
+        )]
     elif daemon:
         last, last_switch = last_log_events()
-        detail = ""
         if last:
             try:
                 ts = datetime.datetime.fromisoformat(
                     last["ts"].replace("Z", "+00:00")
                 ).timestamp()
-                detail = f" · last check {rel_age(ts)}"
+                details.append((f"Last checked {rel_age(ts)}", GRAY))
             except Exception:
                 pass
-        # A live process is not a working one. cswap kept ticking for two weeks
-        # while every tick died on an OverflowError, and this row stayed green
-        # the whole time because it only checked that the daemon existed.
-        failing = (last or {}).get("event") == "error"
-        if failing:
-            print(f"Auto-switch: running but FAILING{detail} | color={RED} size=12")
-            print(
-                f"   {str((last or {}).get('message'))[:70]} | "
-                f"size=11 color={ORANGE} trim=false"
-            )
+        # Health follows the last tick, rather than process existence alone.
+        if (last or {}).get("event") == "error":
+            status, color = "FAILING", RED
+            details.append((str((last or {}).get("message"))[:70], ORANGE))
         elif (last or {}).get("reason") == "unmanaged-active-account":
-            print(f"Auto-switch: login not connected{detail} | color={ORANGE} size=12")
-            print(f"   Connect the current Claude login to enable switching | size=11 color={GRAY}")
+            status, color = "login not connected", ORANGE
+            details.append(("Connect the current Claude login to enable switching", GRAY))
         else:
-            print(f"Auto-switch: running{detail} | color={GREEN} size=12")
+            status, color = "running", GREEN
         if last_switch:
             to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
-            print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
-        print(
-            f"⏸ Pause auto-switch (stay on this account) | bash={PLUGIN} param1=pause-auto "
-            f"terminal=false refresh=true size=12 color={ORANGE}"
-        )
+            details.append((f"Last switch → {to} ({last_switch.get('ts', '')})", GRAY))
+        actions = [(
+            "Pause auto-switch",
+            f"bash={PLUGIN} param1=pause-auto terminal=false refresh=true size=12 color={ORANGE}",
+        )]
     else:
-        print(f"Auto-switch daemon NOT running | color={RED} size=12")
-        print(
-            f"   ↳ start: launchctl kickstart {AUTO_TARGET} | "
-            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} "
-            f"terminal=false refresh=true size=11 trim=false"
-        )
+        status, color = "not running", RED
+        actions = [(
+            "Start auto-switch",
+            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} terminal=false refresh=true size=12",
+        )]
+    print(f"Auto-switch: {status} | color={color} size=12")
+    print_actions(actions)
+    for detail, detail_color in details:
+        print(f"--{detail} | size=11 color={detail_color} trim=false")
 
 
 def main():
