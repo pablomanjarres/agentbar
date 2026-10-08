@@ -79,6 +79,8 @@ python3 tests/test_codex.py --live   # run the checks, including the network one
 
 Each lane is independent. Codex works with only `codex login` done, Claude works with only ccusage installed, and a lane with no data says so instead of showing zeros.
 
+Auto-switch controls are under its status row. Other controls and billing are under **Settings**. Option-click the menu icon to reveal SwiftBar's built-in tools.
+
 ### Configuration
 
 **Codex prices.** Rates ship in `DEFAULT_CODEX_PRICES` and are overridden per model, without editing the plugin, from `~/.config/agentbar/codex-prices.json`. Values are USD per 1M tokens, where `cached` prices the `cached_input_tokens` slice *of* `input_tokens` rather than an extra charge on top:
