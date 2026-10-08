@@ -32,6 +32,7 @@ def load(tmp, *, cswap=True, codex=True, partial_windows=False, stale=False):
     ab.ADMIN_KEY_PATH = os.path.join(ab.SECRETS_DIR, "none")
     ab.CLAUDE_SETTINGS = os.path.join(tmp, "settings.json")
     ab.HIDE_EMAILS_FLAG = os.path.join(ab.CACHE_DIR, "hide")
+    ab.HIDDEN_ACCOUNTS_PATH = os.path.join(tmp, "hidden-accounts.json")
     ab.PAUSE_FLAG = os.path.join(ab.CACHE_DIR, "paused")
     ab.CSWAP_ROOT = os.path.join(tmp, "cswap") if cswap else os.path.join(tmp, "gone")
     ab.CODEX_AUTH = os.path.join(tmp, "codex-auth.json") if codex else os.path.join(tmp, "gone.json")
