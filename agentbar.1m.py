@@ -1438,6 +1438,90 @@ def print_daemon(daemon, hidden):
         print(f"--{detail} | size=11 color={detail_color} trim=false")
 
 
+def print_billing(stats, active_email):
+    """Billing details belong under Settings, including optional setup hints."""
+    whose = f" · {active_email}" if active_email else ""
+    print(f"--Credits & billing{whose} | size=12")
+    credits = stats.get("credits")
+    if credits:
+        sp = credits.get("spend") or {}
+        eu = credits.get("extra_usage") or {}
+        if sp.get("enabled"):
+            used = minor_to_usd(sp.get("used"))
+            line = f"Usage credits: {money(used or 0)} used"
+            bal = minor_to_usd(sp.get("balance"))
+            if bal is not None:
+                line += f" · balance {money(bal)}"
+            if sp.get("percent"):
+                line += f" ({sp['percent']}%)"
+            color = state_color(float(sp.get("percent") or 0))
+            print(f"----{line} | font=Menlo size=12 trim=false color={color}")
+        else:
+            print(f"----Usage credits: off | size=12 color={GRAY}")
+        if eu.get("is_enabled"):
+            used = eu.get("used_credits")
+            dp = eu.get("decimal_places")
+            shown = money(used / 10 ** dp) if used is not None and dp else str(used)
+            line = f"Extra usage: {shown} used"
+            if eu.get("monthly_limit"):
+                lim = eu["monthly_limit"] / 10 ** dp if dp else eu["monthly_limit"]
+                line += f" of {money(lim) if dp else lim}"
+            print(f"----{line} | font=Menlo size=12 trim=false")
+        else:
+            print(f"----Extra usage: off | size=12 color={GRAY}")
+    else:
+        print(f"----Credit state unavailable | size=11 color={GRAY}")
+    api_cost = stats.get("api_cost")
+    if api_cost is None:
+        print(
+            f"----API credits (Console): not tracked · add admin key to "
+            f"~/.swiftbar/.secrets/anthropic-admin-key | size=11 color={GRAY}"
+        )
+    elif api_cost.get("error"):
+        print(f"----API credits (Console): fetch failed ({api_cost['error']}) | size=11 color={ORANGE}")
+    else:
+        print(
+            f"----API credits (Console): {money(api_cost['month_usd'])} this month "
+            f"| font=Menlo size=12 trim=false"
+        )
+
+
+def print_settings(stats, has_cswap, hidden, active_email):
+    """Less frequent controls share one Settings submenu."""
+    print("Settings | size=12")
+    pet_label = "Show the Codex pet" if os.path.exists(HIDE_PET_FLAG) else "Hide the Codex pet"
+    toggle_label = "Show emails" if hidden else "Hide emails"
+    actions = [
+        ("Refresh stats now", f"bash={PLUGIN} param1=refresh-stats terminal=false refresh=true"),
+        (toggle_label, f"bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"),
+        (pet_label, f"bash={PLUGIN} param1=toggle-pet terminal=false refresh=true"),
+    ]
+    if has_cswap:
+        actions.append((
+            "Open cswap dashboard (TUI)", f"bash=/usr/bin/open param1={TUI_CMD} terminal=false",
+        ))
+    if os.path.isfile(ACCOUNT_SETUP_CMD):
+        actions.append((
+            "Connect Claude accounts", f"bash=/usr/bin/open param1={ACCOUNT_SETUP_CMD} terminal=false",
+        ))
+    actions.append((
+        "Open Codex usage settings",
+        "bash=/usr/bin/open param1=https://chatgpt.com/codex/settings/usage terminal=false",
+    ))
+    print_actions(actions)
+    print_billing(stats, active_email)
+    print("--Diagnostics | size=12")
+    diagnostics = []
+    if has_cswap:
+        diagnostics.append(("Open auto-switch log", f"bash=/usr/bin/open param1={AUTO_LOG} terminal=false"))
+    diagnostics.append((
+        "Rebuild spend ledger",
+        f"bash={PLUGIN} param1=rebuild-ledger terminal=false refresh=true alternate=true",
+    ))
+    print_actions(diagnostics, prefix="----")
+    print(f"----Updates every minute | size=11 color={GRAY}")
+
+
 def main():
     ensure_tui_command()
     seq = load_json(os.path.join(CSWAP_ROOT, "sequence.json")) or {}
@@ -1567,90 +1651,15 @@ def main():
     print("---")
     print_spend(stats)
 
-    # ---- credits & billing lanes ----
-    print("---")
-    active_email = display_email(accounts.get(str(active), {}).get("email", "?"), hidden)
-    whose = f" · {active_email}" if has_cswap else ""
-    print(f"Credits & billing{whose} | size=11 color={GRAY}")
-    credits = stats.get("credits")
-    if credits:
-        sp = credits.get("spend") or {}
-        eu = credits.get("extra_usage") or {}
-        if sp.get("enabled"):
-            used = minor_to_usd(sp.get("used"))
-            line = f"Usage credits: {money(used or 0)} used"
-            bal = minor_to_usd(sp.get("balance"))
-            if bal is not None:
-                line += f" · balance {money(bal)}"
-            if sp.get("percent"):
-                line += f" ({sp['percent']}%)"
-            color = state_color(float(sp.get("percent") or 0))
-            print(f"{line} | font=Menlo size=12 trim=false color={color}")
-        else:
-            print(f"Usage credits: off | size=12 color={GRAY}")
-        if eu.get("is_enabled"):
-            used = eu.get("used_credits")
-            dp = eu.get("decimal_places")
-            shown = money(used / 10 ** dp) if used is not None and dp else str(used)
-            line = f"Extra usage: {shown} used"
-            if eu.get("monthly_limit"):
-                lim = eu["monthly_limit"] / 10 ** dp if dp else eu["monthly_limit"]
-                line += f" of {money(lim) if dp else lim}"
-            print(f"{line} | font=Menlo size=12 trim=false")
-        else:
-            print(f"Extra usage: off | size=12 color={GRAY}")
-    else:
-        print(f"credit state unavailable | size=11 color={GRAY}")
-    api_cost = stats.get("api_cost")
-    if api_cost is None:
-        print(
-            f"API credits (Console): not tracked · add admin key to "
-            f"~/.swiftbar/.secrets/anthropic-admin-key | size=11 color={GRAY}"
-        )
-    elif api_cost.get("error"):
-        print(f"API credits (Console): fetch failed ({api_cost['error']}) | size=11 color={ORANGE}")
-    else:
-        print(
-            f"API credits (Console): {money(api_cost['month_usd'])} this month "
-            f"| font=Menlo size=12 trim=false"
-        )
-
     # ---- auto-switch daemon ----
     if has_cswap:
         print("---")
         print_daemon(daemon, hidden)
 
-    # ---- actions ----
+    # ---- settings ----
     print("---")
-    pet_label = "Show the Codex pet" if os.path.exists(HIDE_PET_FLAG) else "Hide the Codex pet"
-    print(f"{pet_label} | bash={PLUGIN} param1=toggle-pet terminal=false refresh=true")
-    toggle_label = "Show emails" if hidden else "Hide emails"
-    print(
-        f"{toggle_label} | bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"
-    )
-    if has_cswap:
-        print(
-            f"Open cswap dashboard (TUI) | bash=/usr/bin/open param1={TUI_CMD} terminal=false"
-        )
-    if os.path.isfile(ACCOUNT_SETUP_CMD):
-        print(
-            f"Connect Claude accounts | bash=/usr/bin/open "
-            f"param1={ACCOUNT_SETUP_CMD} terminal=false"
-        )
-    print(
-        f"Open Codex usage settings | bash=/usr/bin/open "
-        f"param1=https://chatgpt.com/codex/settings/usage terminal=false"
-    )
-    if has_cswap:
-        print(f"Open auto-switch log | bash=/usr/bin/open param1={AUTO_LOG} terminal=false")
-    print(
-        f"Refresh stats now | bash={PLUGIN} param1=refresh-stats terminal=false refresh=true"
-    )
-    print(
-        f"Rebuild spend ledger | bash={PLUGIN} param1=rebuild-ledger "
-        f"terminal=false refresh=true alternate=true"
-    )
-    print(f"claude-swap + ccusage + codex · updates every 1m | size=10 color={GRAY}")
+    active_email = display_email(accounts.get(str(active), {}).get("email", "?"), hidden) if has_cswap else ""
+    print_settings(stats, has_cswap, hidden, active_email)
 
 
 if __name__ == "__main__":
