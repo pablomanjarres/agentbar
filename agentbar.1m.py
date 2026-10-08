@@ -1087,13 +1087,13 @@ def print_gauges(windows, prefix=""):
         print(f"{prefix}{line} | font=Menlo size=11 trim=false color={state_color(pct)}")
 
 
-def print_rows(rows):
+def print_rows(rows, prefix=""):
     """Label + value lines for a spend block."""
     for label, text in rows:
-        print(f"{label:<6} {text} | font=Menlo size=12 trim=false")
+        print(f"{prefix}{label:<6} {text} | font=Menlo size=12 trim=false")
 
 
-def print_unpriced(models, hint):
+def print_unpriced(models, hint, prefix=""):
     """Warn about models that burned tokens at $0.
 
     Their spend is missing from every total above, so the figure reads low with
@@ -1103,10 +1103,76 @@ def print_unpriced(models, hint):
     if not models:
         return
     print(
-        f"⚠ {', '.join(models)}: no price — spend above is too low "
+        f"{prefix}⚠ {', '.join(models)}: no price — spend above is too low "
         f"| size=11 color={ORANGE} trim=false"
     )
-    print(f"   {hint} | size=11 color={GRAY} trim=false")
+    print(f"{prefix}   {hint} | size=11 color={GRAY} trim=false")
+
+
+def spend_rows(totals):
+    """Common daily, monthly and lifetime details for a spend summary."""
+    rows = []
+    for key, label in (("today", "Today"), ("month", "Month"), ("alltime", "Total")):
+        value = totals.get(key)
+        if not value:
+            continue
+        detail = money(value.get("cost") or 0)
+        if "tokens" in value:
+            detail += f" · {tokens_h(value['tokens'])} tok"
+        if value.get("days"):
+            detail += f" · {value['days']}d"
+        rows.append((label, detail))
+    return rows
+
+
+def print_spend_summary(label, totals, rows, *, unpriced=(), hint="", empty="not available yet"):
+    """One summary row with its full metrics and warnings in a submenu."""
+    warning = " ⚠" if unpriced else ""
+    if not totals:
+        print(f"{label}{warning}  {empty} | size=12 color={GRAY}")
+    else:
+        today = (totals.get("today") or {}).get("cost") or 0
+        month = (totals.get("month") or {}).get("cost") or 0
+        print(f"{label}{warning}  {money(today)} today · {money(month)} month | size=12")
+        print_rows(rows, prefix="--")
+    print_unpriced(unpriced, hint, prefix="--")
+
+
+def print_spend(stats):
+    """Compose compact provider summaries without discarding their details."""
+    print(f"API-equivalent spend · this Mac | size=11 color={GRAY}")
+    claude = {key: stats.get(key) for key in ("today", "month", "alltime")}
+    if not (claude["today"] or claude["alltime"]):
+        claude = {}
+    codex = stats.get("codex_spend") or {}
+    if not (codex.get("alltime") or {}).get("days"):
+        codex = {}
+    rows = spend_rows(claude)
+    block = stats.get("block")
+    if claude and block:
+        rows.insert(1, (
+            "Block",
+            f"{money(block['cost'])} · {money(block['perHour'])}/hr → "
+            f"{money(block['projCost'])} by {local_clock(block.get('end') or '')}",
+        ))
+    elif claude and block is None and "fastAt" in stats:
+        rows.insert(1, ("Block", "no active 5h block"))
+    print_spend_summary(
+        "Claude", claude, rows, unpriced=stats.get("unpriced") or (),
+        hint="add it to pricingOverrides in ~/.claude/ccusage.json",
+    )
+    print_spend_summary(
+        "Codex", codex, spend_rows(codex),
+        unpriced=(stats.get("codex_spend") or {}).get("unpriced") or (),
+        hint=f"add a price in {CODEX_PRICES_PATH}", empty="no Codex sessions on this Mac",
+    )
+    both = {}
+    if claude or codex:
+        for key in ("today", "month", "alltime"):
+            values = [(provider.get(key) or {}) for provider in (claude, codex)]
+            both[key] = {field: sum(value.get(field) or 0 for value in values)
+                         for field in ("cost", "tokens")}
+    print_spend_summary("Both", both, spend_rows(both))
 
 
 def daemon_running():
@@ -1496,85 +1562,7 @@ def main():
 
     # ---- spend stats ----
     print("---")
-    print(f"API-equivalent spend · this Mac | size=11 color={GRAY}")
-    month = stats.get("month")
-    alltime = stats.get("alltime")
-    print(f"Claude Code | size=11 color={GRAY}")
-    if today or alltime:
-        rows = []
-        if today:
-            rows.append(("Today", f"{money(today['cost'])} · {tokens_h(today['tokens'])} tok"))
-        if block:
-            rows.append(
-                (
-                    "Block",
-                    f"{money(block['cost'])} · {money(block['perHour'])}/hr → "
-                    f"{money(block['projCost'])} by {local_clock(block.get('end') or '')}",
-                )
-            )
-        elif block is None and "fastAt" in stats:
-            rows.append(("Block", "no active 5h block"))
-        if month:
-            rows.append(("Month", money(month["cost"])))
-        if alltime:
-            rows.append(
-                (
-                    "Total",
-                    f"{money(alltime['cost'])} · {tokens_h(alltime['tokens'])} tok "
-                    f"· {alltime['days']}d",
-                )
-            )
-        print_rows(rows)
-        print_unpriced(
-            stats.get("unpriced"), "add it to pricingOverrides in ~/.claude/ccusage.json"
-        )
-    else:
-        print(f"   not available yet (ccusage) | size=11 color={GRAY}")
-
-    codex_spend = stats.get("codex_spend") or {}
-    print(f"Codex · ChatGPT | size=11 color={GRAY}")
-    if (codex_spend.get("alltime") or {}).get("days"):
-        print_rows(
-            [
-                (
-                    "Today",
-                    f"{money(codex_spend['today']['cost'])} · "
-                    f"{tokens_h(codex_spend['today']['tokens'])} tok",
-                ),
-                (
-                    "Month",
-                    f"{money(codex_spend['month']['cost'])} · "
-                    f"{tokens_h(codex_spend['month']['tokens'])} tok",
-                ),
-                (
-                    "Total",
-                    f"{money(codex_spend['alltime']['cost'])} · "
-                    f"{tokens_h(codex_spend['alltime']['tokens'])} tok "
-                    f"· {codex_spend['alltime']['days']}d",
-                ),
-            ]
-        )
-        print_unpriced(
-            codex_spend.get("unpriced"), f"add a price in {CODEX_PRICES_PATH}"
-        )
-    else:
-        print(f"   no Codex sessions on this Mac | size=11 color={GRAY}")
-
-    # the two numbers that answer "what have these agents cost me", combined
-    both_month = ((month or {}).get("cost") or 0) + (
-        (codex_spend.get("month") or {}).get("cost") or 0
-    )
-    claude_all = alltime or {}
-    codex_all = codex_spend.get("alltime") or {}
-    both_all = (claude_all.get("cost") or 0) + (codex_all.get("cost") or 0)
-    both_tokens = (claude_all.get("tokens") or 0) + (codex_all.get("tokens") or 0)
-    if both_all or both_month:
-        print(f"Both agents | size=11 color={GRAY}")
-        print(f"{'Month':<6} {money(both_month)} | font=Menlo size=12 trim=false")
-        print(
-            f"{'Total':<6} {money(both_all)} · {tokens_h(both_tokens)} tok "
-            f"| font=Menlo size=12 color={RUST} trim=false"
-        )
+    print_spend(stats)
 
     # ---- credits & billing lanes ----
     print("---")
