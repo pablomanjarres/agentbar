@@ -1511,7 +1511,7 @@ def main():
 
     # ---- accounts ----
     if has_cswap:
-        print(f"Claude Max accounts · active window used (5h·7d) | size=11 color={GRAY}")
+        print(f"Claude accounts · active window used (5h·7d) | size=11 color={GRAY}")
     else:
         print(
             f"Claude accounts · claude-swap not set up, gauges off | size=11 color={GRAY}"
