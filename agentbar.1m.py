@@ -35,8 +35,10 @@ Actions re-invoke this file with argv: switch <n> | refresh-stats | rebuild-ledg
 """
 import base64
 import datetime
+import fcntl
 import io
 import json
+import math
 import os
 import struct
 import subprocess
@@ -87,23 +89,37 @@ HIDDEN_ACCOUNTS_PATH = os.path.join(CONFIG_DIR, "hidden-accounts.json")
 # itself reads, and it only answers with the originator header set.
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_UA = "codex_cli_rs/0.142.5"
-CODEX_MARK = "\u2733"  # the mark next to Claude's circled number in the title
+# Drawn in place of the pet on the Codex item when no pet can be drawn. An SF
+# Symbol rather than a logo: the item still reads as "the coding agent" and
+# nothing of OpenAI's ships in this file.
+CODEX_SFIMAGE = "chevron.left.forwardslash.chevron.right"
 
 # --- the Codex pet ---------------------------------------------------------
 # Codex ships desktop "pets": one sprite sheet per pet inside the app's asar.
 # The art is OpenAI's, so this plugin does NOT carry a copy. It reads the sheet
 # out of the local Codex install, crops the frames it needs once, and caches
 # them. No Codex app, no pet. No Pillow, no pet. Nothing else breaks either way.
-CODEX_ASAR = "/Applications/Codex.app/Contents/Resources/app.asar"
+# Codex has shipped as its own app and, later, inside ChatGPT.app.
+CODEX_ASARS = (
+    "/Applications/Codex.app/Contents/Resources/app.asar",
+    "/Applications/ChatGPT.app/Contents/Resources/app.asar",
+)
+# Custom pets made in Codex are stored in the cloud. A local copy goes in a
+# folder shaped like Codex's own ~/.codex/pets/<name>/: a pet.json naming its
+# spritesheetPath, beside the sheet. agentbar's folder is searched first so a
+# copy made for the menu bar never shows up twice in Codex's own pet picker.
+PET_DIRS = [os.path.join(CONFIG_DIR, "pets"), os.path.join(CODEX_ROOT, "pets")]
+# One line naming the pet to wear: a folder above, or a pet bundled with Codex.
+PET_CHOICE_PATH = os.path.join(CONFIG_DIR, "pet")
 PET_DIR = os.path.join(CACHE_DIR, "pet")
 HIDE_PET_FLAG = os.path.join(CACHE_DIR, "hide-pet")
 # Bump when the crop changes shape: moods, cell geometry or bar height. The
-# cache key is the asar's mtime, which does not move when this file does, so
+# cache key is the sheet's mtime, which does not move when this file does, so
 # without it a fix would never reach anyone who already has cached frames.
-PET_CACHE_VERSION = 2
-PET_NAME = "seedy"
-PET_LABEL = "Seedy"
-PET_BLURB = "Small green shoots for new ideas."
+PET_CACHE_VERSION = 3
+DEFAULT_PET = "seedy"
+# Height of the bust cropped from a tall pet, as a multiple of its width.
+PET_BUST_RATIO = 1.3
 PET_BAR_PX = 36  # 18pt at 144 dpi, matching ICON. See the dpi= on save().
 # Frame geometry read off the sheet the Codex app animates. Columns and cell
 # height have been stable across sprite versions; a sheet that does not divide
@@ -119,15 +135,30 @@ PET_MOODS = {
     "strained": (5, 0),
     "spent": (5, 2),
 }
-# Gap between the Claude glyph and the pet, in the 144 dpi pixel space both
-# are drawn in, so the pair reads as one item rather than two.
-PET_GAP_PX = 5
 PET_CAPTIONS = {
     "calm": "plenty of headroom",
     "working": "on the clock",
     "strained": "running low",
     "spent": "out of window",
 }
+
+
+
+def role_for(path):
+    """Which menu bar item this copy renders, from the name it was run under.
+
+    SwiftBar gives each plugin one item with one image, and each agent wants
+    its own mark beside its own number. So the plugin is installed twice: as
+    agentbar.1m.py for Claude, and as a symlink agentbar-codex.1m.py for Codex.
+    Both draw the same menu; only the title differs.
+    """
+    return "codex" if os.path.basename(path).startswith("agentbar-codex") else "claude"
+
+
+ROLE = role_for(__file__)
+# Where the Codex item would sit beside this one; without it, the Claude item
+# carries the spend so a single-item install does not lose it.
+SIBLING_CODEX_ITEM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentbar-codex.1m.py")
 
 ENV = dict(os.environ)
 ENV["PATH"] = ":".join(
@@ -147,6 +178,8 @@ RUST = "#e07a42"
 GREEN = "#34a853"
 ORANGE = "#ff9500"
 RED = "#ff3b30"
+# cswap usage keys for the account-wide rate-limit windows, with their labels
+CLAUDE_WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
 CIRCLED = "➊➋➌➍➎➏➐➑➒➓"
 
 FAST_TTL = 50      # seconds: today + active block
@@ -774,36 +807,101 @@ def asar_lookup(path, wanted):
         return f.read(int(entry["size"]))
 
 
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def codex_asar():
+    """Path of the installed Codex app archive, or None."""
+    return next((path for path in CODEX_ASARS if os.path.isfile(path)), None)
+
+
+def pet_name():
+    try:
+        with open(PET_CHOICE_PATH) as f:
+            return f.read().strip().lower() or DEFAULT_PET
+    except OSError:
+        return DEFAULT_PET
+
+
+def pet_folder(name):
+    """(folder, pet.json) of a local pet, or (None, {})."""
+    for root in PET_DIRS:
+        folder = os.path.join(root, name)
+        meta = load_json(os.path.join(folder, "pet.json"))
+        if isinstance(meta, dict):
+            return folder, meta
+    return None, {}
+
+
+def pet_label():
+    name = pet_name()
+    _, meta = pet_folder(name)
+    return meta.get("displayName") or meta.get("name") or name.title()
+
+
+def pet_sheet(name):
+    """(path, reader) for a pet's sprite sheet, or None when it has none here.
+
+    The path's mtime dates the art for the frame cache; the reader returns the
+    sheet's bytes and is only called on a cache miss.
+    """
+    folder, meta = pet_folder(name)
+    rel = meta.get("spritesheetPath") or meta.get("spritesheet")
+    if folder and rel:
+        path = os.path.realpath(os.path.join(folder, rel))
+        inside = path.startswith(os.path.realpath(folder) + os.sep)
+        if inside and os.path.isfile(path):
+            return path, lambda: read_bytes(path)
+    asar = codex_asar()
+    if asar:
+        return asar, lambda: asar_lookup(asar, name + "-spritesheet")
+    return None
+
+
 def pet_icon(mood):
     """base64 PNG of one pet mood, or None when the pet cannot be drawn.
 
-    Cropped from the sprite sheet in the user's own Codex install and cached per
-    (sheet mtime, mood), so Pillow is touched on a version change and never on a
-    routine refresh.
+    Cropped from the pet's sprite sheet and cached per (pet, sheet mtime,
+    mood), so Pillow is touched on a version change and never on a routine
+    refresh.
     """
     if os.path.exists(HIDE_PET_FLAG) or mood not in PET_MOODS:
         return None
+    name = pet_name()
+    sheet_at = pet_sheet(name)
+    if not sheet_at:
+        return None  # no Codex install and no local pet
+    path, read_sheet = sheet_at
     try:
-        stamp = int(os.path.getmtime(CODEX_ASAR))
+        stamp = int(os.path.getmtime(path))
     except OSError:
-        return None  # Codex not installed
+        return None
     cached = os.path.join(
-        PET_DIR, f"{PET_NAME}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
+        PET_DIR, f"{name}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
     )
     try:
         with open(cached) as f:
             return f.read()
     except OSError:
         pass
+    # a name the sheet does not hold is remembered per sheet version, so the
+    # archive is not parsed again every minute just to find nothing
+    missing = os.path.join(PET_DIR, f"{name}-missing-v{PET_CACHE_VERSION}-{stamp}")
+    if os.path.exists(missing):
+        return None
     try:
         from PIL import Image  # optional: no Pillow, no pet
     except Exception:
         return None
     try:
-        # asar_lookup reads a third-party binary that Codex rewrites on update;
-        # a truncated or mid-write archive must not take the menu bar down
-        blob = asar_lookup(CODEX_ASAR, PET_NAME + "-spritesheet")
+        # the asar is a third-party binary that Codex rewrites on update; a
+        # truncated or mid-write archive must not take the menu bar down
+        blob = read_sheet()
         if not blob:
+            os.makedirs(PET_DIR, exist_ok=True)
+            open(missing, "w").close()
             return None
         sheet = Image.open(io.BytesIO(blob)).convert("RGBA")
         cw = sheet.width // PET_COLS
@@ -814,6 +912,10 @@ def pet_icon(mood):
             return None
         cell = sheet.crop((col * cw, row * PET_CELL_H, (col + 1) * cw, (row + 1) * PET_CELL_H))
         cell = cell.crop(cell.getbbox() or (0, 0, cw, PET_CELL_H))
+        if cell.height > 2 * cell.width:
+            # a standing figure scaled to 18pt leaves its face a few points
+            # high; head and shoulders read as the character, a stick does not
+            cell = cell.crop((0, 0, cell.width, round(cell.width * PET_BUST_RATIO)))
         scale = PET_BAR_PX / cell.height
         cell = cell.resize(
             (max(1, round(cell.width * scale)), PET_BAR_PX), Image.NEAREST
@@ -834,57 +936,6 @@ def pet_icon(mood):
     return data
 
 
-def title_icon(mood):
-    """Both marks in one image: the Claude glyph, then the pet.
-
-    SwiftBar allows one image per line, and dropping the Claude glyph for the
-    pet quietly removed the only sign that this item tracks Claude at all. They
-    are composited instead, at the same 36px/144 dpi as ICON so the pair keeps
-    the height a menu bar item is allowed.
-
-    Falls back to the bare glyph whenever the pet cannot be drawn, which is the
-    behaviour every other pet path already has.
-    """
-    pet = pet_icon(mood)
-    if not pet:
-        return ICON
-    # Keyed on the asar's mtime as well, exactly like pet_icon: without it a new
-    # sprite sheet regenerates the frame but this composite keeps serving the
-    # old one until PET_CACHE_VERSION is bumped in source.
-    try:
-        stamp = int(os.path.getmtime(CODEX_ASAR))
-    except OSError:
-        return ICON
-    cached = os.path.join(
-        PET_DIR, f"title-{PET_NAME}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
-    )
-    try:
-        with open(cached) as f:
-            return f.read()
-    except OSError:
-        pass
-    try:
-        from PIL import Image
-
-        left = Image.open(io.BytesIO(base64.b64decode(ICON))).convert("RGBA")
-        right = Image.open(io.BytesIO(base64.b64decode(pet))).convert("RGBA")
-        height = max(left.height, right.height)
-        out = Image.new("RGBA", (left.width + PET_GAP_PX + right.width, height), (0, 0, 0, 0))
-        out.alpha_composite(left, (0, height - left.height))
-        out.alpha_composite(right, (left.width + PET_GAP_PX, height - right.height))
-        buf = io.BytesIO()
-        out.save(buf, format="PNG", optimize=True, dpi=(144, 144))
-        data = base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        return ICON
-    try:
-        os.makedirs(PET_DIR, exist_ok=True)
-        atomic_write_text(cached, data)
-    except OSError:
-        pass
-    return data
-
-
 def pet_mood(worst, busy, limit_reached):
     """Which frame the pet wears, from how close either agent is to its wall."""
     if limit_reached or worst >= 95:
@@ -895,7 +946,22 @@ def pet_mood(worst, busy, limit_reached):
 
 
 def refresh_stats(force=False, active_num=None):
+    """Cached stats, refreshed past their TTLs.
+
+    Both menu bar items tick in the same minute. The lock makes the second wait
+    for the first and then find the stats fresh, instead of running ccusage and
+    the network lane a second time alongside it.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(os.path.join(CACHE_DIR, "refresh.lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:
+            pass  # no lock is a duplicate refresh, never a missing menu
+        return _refresh_stats(force, active_num)
+
+
+def _refresh_stats(force, active_num):
     st = load_json(STATS_PATH) or {}
     now = time.time()
     changed = False
@@ -1273,13 +1339,23 @@ def handle_action(argv):
         pause_auto()
     elif argv[0] == "resume-auto":
         resume_auto()
+    # both items draw the same menu; refresh=true only reruns the one clicked
+    try:
+        subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshallplugins"], timeout=10)
+    except Exception:
+        pass
     sys.exit(0)
+
+
+def is_api_key_account(email):
+    """claude-swap files setup-token (API billing) logins under @token.local."""
+    return (email or "").endswith("@token.local")
 
 
 def display_email(email, hidden):
     if not hidden:
         return email
-    if email.endswith("@token.local"):
+    if is_api_key_account(email):
         return "API key account"
     local, _, domain = email.partition("@")
     return f"{local[:1]}•••@{domain[:1]}•••"
@@ -1329,7 +1405,7 @@ def account_windows(lastgood):
     if not lastgood:
         return
     standard = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+    for key, label in CLAUDE_WINDOWS:
         w = claude_window(lastgood.get(key))
         if w:
             standard.append(w)
@@ -1343,10 +1419,84 @@ def account_windows(lastgood):
             yield scoped.get("name", "model")[:5], w
 
 
-def print_account(num, meta, usage, active, hidden):
+def valid_cap(raw):
+    return isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) and 0 < raw <= 100
+
+
+def usage_caps(accounts):
+    """Per-account usage cap in percent, from claude-swap's auto-switch policy.
+
+    The daemon moves off an account once it reaches its cap, so a cap below 100
+    holds the rest of that account in reserve and it never drains fully. The
+    validation mirrors claude-swap's AutoSwitchEngine.usage_cap exactly: any
+    cap the daemon would not honour reads as 100 here too.
+    """
+    policy = load_json(os.path.join(CSWAP_ROOT, "autoswitch-policy.json"))
+    if not isinstance(policy, dict) or policy.get("schemaVersion") != 1:
+        return {num: 100.0 for num in accounts}
+    by_uuid = policy.get("accountUsageCaps", {})
+    caps = {}
+    for num, meta in accounts.items():
+        if isinstance(by_uuid, dict):
+            raw = by_uuid.get(meta.get("uuid"), policy.get("defaultUsageCap", 100))
+        else:
+            raw = 100
+        caps[num] = float(raw) if valid_cap(raw) else 100.0
+    return caps
+
+
+def pool_members(seq, usage):
+    """Account numbers auto-switch can rotate onto right now.
+
+    The rotation is claude-swap's own `sequence`, so an account hidden from the
+    menu still counts. API-key accounts are billed per token, and an account
+    whose last refresh failed has no current reading to pool.
+    """
+    accounts = seq.get("accounts") or {}
+    members = []
+    for n in seq.get("sequence") or []:
+        num = str(n)
+        if num not in accounts or is_api_key_account(accounts[num].get("email")):
+            continue
+        if (usage.get(num) or {}).get("lastError"):
+            continue
+        members.append(num)
+    return members
+
+
+def pooled_pct(members, usage, caps, key):
+    """One window's use across every account auto-switch rotates through.
+
+    Each account adds its cap to the pool and its use, clamped to that cap, to
+    the total: four accounts at 100% make a 400% pool, so one spent account
+    moves the number by 25% rather than to 100%. An account that has hit its cap
+    on any window cannot serve at all, so it counts as spent here too. A window
+    whose reset has passed counts as unused; an account that does not report the
+    window stays out of it. None when no account has a live reading.
+    """
+    used = capacity = 0.0
+    live = False
+    for num in members:
+        cap = caps.get(num, 100.0)
+        good = (usage.get(num) or {}).get("lastGood") or {}
+        windows = {k: claude_window(good.get(k)) for k, _ in CLAUDE_WINDOWS}
+        blocked = any(w and not w["stale"] and w["pct"] >= cap for w in windows.values())
+        w = windows[key]
+        if not w:
+            continue
+        if blocked:
+            used += cap
+        elif not w["stale"]:
+            used += min(w["pct"], cap)
+        capacity += cap
+        live = live or blocked or not w["stale"]
+    return used / capacity * 100 if live and capacity else None
+
+
+def print_account(num, meta, usage, active, hidden, cap=100.0):
     """One summary row, with full usage and manual switching in its submenu."""
     email = meta.get("email", f"account {num}")
-    token_account = email.endswith("@token.local")
+    token_account = is_api_key_account(email)
     lastgood = usage.get("lastGood") or {}
     windows = list(account_windows(lastgood))
     summary = []
@@ -1359,6 +1509,8 @@ def print_account(num, meta, usage, active, hidden):
         summary = ["manual"]
     elif not summary:
         summary = ["no usage"]
+    if cap < 100 and not token_account:
+        summary.append(f"reserve · cap {cap:.0f}%")
     error = usage.get("lastError")
     if error and not token_account:
         summary.append(f"⚠ {str(error)[:24]}")
@@ -1543,68 +1695,58 @@ def main():
     stats = refresh_stats(active_num=active)
 
     # ---- menu bar title ----
-    act_usage = (usage.get(str(active)) or {}).get("lastGood") or {}
-
-    def live_pct(key):
-        """Percentage for one window, or None once its reset has gone by."""
-        w = claude_window(act_usage.get(key))
-        return None if not w or w.get("stale") else w["pct"]
-
-    p5 = live_pct("five_hour")
-    p7 = live_pct("seven_day")
+    caps = usage_caps(seq.get("accounts") or {})
+    members = pool_members(seq, usage)
+    p5 = pooled_pct(members, usage, caps, "five_hour")
+    p7 = pooled_pct(members, usage, caps, "seven_day")
     codex_usage = stats.get("codex_usage")
     # a cached reading is kept across a failed refresh, so expired windows are
     # dropped before anything colours the menu bar off them
     codex_wins = fresh_windows((codex_usage or {}).get("windows") or [])
     codex_pcts = [w["pct"] for _, w in codex_wins]
-    # the warning colour tracks whichever agent is closest to its wall
-    all_pcts = [
-        w["pct"] for _, w in account_windows(act_usage) if not w.get("stale")
-    ] + codex_pcts
-    worst = max(all_pcts) if all_pcts else 0
-    prefix = ""
-    if has_cswap and not daemon:
-        prefix = "⚠️ "
-    elif worst >= 90:
-        prefix = "🔴 "
-    elif worst >= 75:
-        prefix = "🟠 "
-    circ = CIRCLED[active - 1] if active and active <= 10 else "•"
+    prefix = "⚠️ " if has_cswap and not daemon else ""
     # an account can report one window without the other; format whatever is there
     shown = [f"{pct:.0f}%" for pct in (p5, p7) if pct is not None]
-    claude_bit = f"{circ} {'·'.join(shown)}" if shown else circ
-    # both agents share one title line so neither is hidden behind a cycle
-    codex_bit = f"  {CODEX_MARK} {max(codex_pcts):.0f}%" if codex_pcts else ""
+    claude_bit = "·".join(shown) if shown else "–"
     today = stats.get("today")
     block = stats.get("block")
     codex_today = ((stats.get("codex_spend") or {}).get("today") or {}).get("cost") or 0
-    # the pet reacts to whichever agent is closest to its wall. limit_reached
-    # gets the same freshness gate as the windows: once they have all expired the
-    # cached flag describes a window that is already over.
-    busy = bool((block or {}).get("perHour")) or codex_today > 0
+    # limit_reached gets the same freshness gate as the windows: once they have
+    # all expired the cached flag describes a window that is already over.
+    busy = codex_today > 0
     hit_limit = bool((codex_usage or {}).get("limit_reached")) and bool(codex_wins)
-    mood = pet_mood(worst, busy, hit_limit)
-    # two images: the pair for the menu bar title, the pet alone for its own row
+    # the pet stands for Codex, so he reacts to Codex's own windows
+    mood = pet_mood(max(codex_pcts) if codex_pcts else 0, busy, hit_limit)
     pet = pet_icon(mood)
-    icon = title_icon(mood)
-    # ONE title line. SwiftBar cycles multiple title lines in the bar but also
-    # repeats every one of them at the top of the dropdown, so a second line
-    # showed the icon and its text twice over. Spend rides along here instead,
-    # and the hourly burn stays in the Block row below where it has room.
+    # ONE title line per item. SwiftBar cycles multiple title lines in the bar
+    # but also repeats every one of them at the top of the dropdown, so a second
+    # line showed the icon and its text twice over. Spend rides along on the
+    # Codex item, the rightmost of the pair, or on the Claude item when it is
+    # installed alone. The hourly burn stays in the Block row below.
     spent = (today or {}).get("cost", 0) + codex_today
     money_bit = f"  ${spent:,.0f}" if spent else ""
-    print(f"{prefix}{claude_bit}{codex_bit}{money_bit} | image={icon}")
+    if ROLE == "codex":
+        codex_bit = f"{max(codex_pcts):.0f}%" if codex_pcts else "–"
+        mark = f"image={pet}" if pet else f"sfimage={CODEX_SFIMAGE}"
+        print(f"{codex_bit}{money_bit} | {mark}")
+    else:
+        if os.path.lexists(SIBLING_CODEX_ITEM):
+            money_bit = ""
+        print(f"{prefix}{claude_bit}{money_bit} | image={ICON}")
     print("---")
 
     # ---- accounts ----
     if has_cswap:
-        print(f"Claude accounts · active window used (5h·7d) | size=11 color={GRAY}")
+        print(f"Claude accounts · pooled use in the title (5h·7d) | size=11 color={GRAY}")
     else:
         print(
             f"Claude accounts · claude-swap not set up, gauges off | size=11 color={GRAY}"
         )
     for num in order:  # empty when claude-swap has no accounts
-        print_account(num, accounts.get(str(num), {}), usage.get(str(num), {}), active, hidden)
+        print_account(
+            num, accounts.get(str(num), {}), usage.get(str(num), {}), active, hidden,
+            cap=caps.get(str(num), 100.0),
+        )
 
     # ---- codex / chatgpt account ----
     print("---")
@@ -1629,10 +1771,8 @@ def main():
             note = "credits: none (plan allowance only)"
         print(f"   {note} | size=11 color={GRAY} trim=false")
         if pet:
-            # the pet alone here: this row is about him, and the composite
-            # would paste the Claude glyph in front of his own name
             print(
-                f"   {PET_LABEL} · {PET_CAPTIONS.get(mood, mood)} | image={pet} "
+                f"   {pet_label()} · {PET_CAPTIONS.get(mood, mood)} | image={pet} "
                 f"size=11 color={GRAY} trim=false"
             )
         if stats.get("codex_error"):

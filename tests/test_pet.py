@@ -3,7 +3,7 @@
 
 The pet art is OpenAI's and is deliberately NOT in this repository: it is read
 out of the local Codex install at runtime. So the asset-backed checks skip
-themselves when Codex.app is absent or Pillow is missing, and one check asserts
+themselves when no Codex app is installed or Pillow is missing, and one check asserts
 the repo stays free of sprite art.
 """
 import base64
@@ -22,6 +22,10 @@ def load():
     spec = importlib.util.spec_from_file_location("agentbar_pet", PLUGIN)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # the bundled-art checks below are about the app's own pet, whatever pet
+    # this Mac has picked or keeps in a local folder
+    mod.PET_CHOICE_PATH = "/nope/pet-choice"
+    mod.PET_DIRS = []
     return mod
 
 
@@ -73,15 +77,15 @@ def test_no_art_in_repo():
 
 
 def test_asar_lookup(ab):
-    if not os.path.exists(ab.CODEX_ASAR):
-        print("skip asar lookup (Codex.app not installed)")
+    if not ab.codex_asar():
+        print("skip asar lookup (no Codex app installed)")
         return
-    blob = ab.asar_lookup(ab.CODEX_ASAR, ab.PET_NAME + "-spritesheet")
+    blob = ab.asar_lookup(ab.codex_asar(), ab.DEFAULT_PET + "-spritesheet")
     assert blob, "sprite sheet not found in the Codex asar"
     assert blob[:4] == b"RIFF" and blob[8:12] == b"WEBP", blob[:12]
     assert len(blob) > 100_000, len(blob)
-    assert ab.asar_lookup(ab.CODEX_ASAR, "definitely-not-a-pet-xyz") is None
-    print(f"ok   asar lookup pulled a {len(blob):,} byte WebP out of Codex.app")
+    assert ab.asar_lookup(ab.codex_asar(), "definitely-not-a-pet-xyz") is None
+    print(f"ok   asar lookup pulled a {len(blob):,} byte WebP out of the Codex app")
 
 
 def png_dpi(data):
@@ -105,8 +109,8 @@ def png_dpi(data):
 
 
 def test_icons(ab):
-    if not os.path.exists(ab.CODEX_ASAR):
-        print("skip pet icons (Codex.app not installed)")
+    if not ab.codex_asar():
+        print("skip pet icons (no Codex app installed)")
         return
     try:
         import PIL  # noqa: F401
@@ -136,8 +140,8 @@ def test_icons(ab):
 
 
 def test_cache_and_optout(ab):
-    if not os.path.exists(ab.CODEX_ASAR):
-        print("skip pet cache (Codex.app not installed)")
+    if not ab.codex_asar():
+        print("skip pet cache (no Codex app installed)")
         return
     with tempfile.TemporaryDirectory() as tmp:
         ab.PET_DIR = os.path.join(tmp, "pet")
@@ -162,67 +166,83 @@ def test_cache_and_optout(ab):
     print("ok   frames cached per sheet version, hide flag respected")
 
 
-def test_title_keeps_both_marks(ab):
-    """The menu bar icon must still say "Claude" as well as showing the pet.
+def test_local_pet_folder(ab):
+    """A pet folder (pet.json + sheet) wins over the app bundle, and names the pet.
 
-    Swapping ICON for the pet quietly removed the only sign the item tracks
-    Claude at all, which is exactly how it got lost the first time.
+    Custom pets made in Codex live in the cloud, so agentbar reads a local copy
+    from a folder in the same shape Codex uses for ~/.codex/pets. The sheet here
+    is drawn on the fly: no art is committed.
     """
-    if not os.path.exists(ab.CODEX_ASAR):
-        print("skip title icon (Codex.app not installed)")
-        return
     try:
-        import PIL  # noqa: F401
+        from PIL import Image
     except ImportError:
-        print("skip title icon (Pillow not installed)")
+        print("skip local pet (Pillow not installed)")
         return
-
     with tempfile.TemporaryDirectory() as tmp:
-        ab.PET_DIR = os.path.join(tmp, "pet")
-        ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
-        glyph_w, glyph_h = png_size(ab.ICON)
-        both = ab.title_icon("calm")
-        assert both != ab.ICON, "pet never made it into the title icon"
-        w, h = png_size(both)
-        assert h == glyph_h, f"title icon is {h}px tall, want {glyph_h}"
-        assert w > glyph_w + ab.PET_GAP_PX, f"title icon is only {w}px wide"
-        assert png_dpi(both) == (5669, 5669, 1), "composite lost its 144 dpi"
+        folder = os.path.join(tmp, "pets", "kick")
+        os.makedirs(folder)
+        sheet = Image.new("RGBA", (ab.PET_COLS * 24, ab.PET_CELL_H * 8), (0, 0, 0, 0))
+        for row in range(8):
+            for col in range(ab.PET_COLS):
+                block = Image.new("RGBA", (10 + col, 40 + row * 5), (row * 30, col * 30, 90, 255))
+                sheet.paste(block, (col * 24 + 2, row * ab.PET_CELL_H + 10))
+        os.makedirs(os.path.join(folder, "art"))
+        sheet.save(os.path.join(folder, "art", "sheet.png"))
+        with open(os.path.join(folder, "pet.json"), "w") as f:
+            f.write('{"id": "kick", "displayName": "Kick", "spritesheetPath": "art/sheet.png"}')
+        with open(os.path.join(tmp, "choice"), "w") as f:
+            f.write("kick\n")
+        saved = (ab.PET_DIRS, ab.PET_CHOICE_PATH, ab.PET_DIR, ab.HIDE_PET_FLAG)
+        try:
+            ab.PET_DIRS = [os.path.join(tmp, "pets")]
+            ab.PET_CHOICE_PATH = os.path.join(tmp, "choice")
+            ab.PET_DIR = os.path.join(tmp, "cache")
+            ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
+            assert ab.pet_label() == "Kick", ab.pet_label()
+            frames = {mood: ab.pet_icon(mood) for mood in ab.PET_MOODS}
+            assert all(frames.values()), frames
+            assert len(set(frames.values())) == len(frames), "moods are not distinct frames"
+            assert all(png_size(f)[1] == ab.PET_BAR_PX for f in frames.values())
+            # these figures are over twice as tall as wide: at 18pt a full body
+            # leaves the face a few points high, so the bar shows a bust instead
+            for frame in frames.values():
+                w, h = png_size(frame)
+                assert 2 * w > h, f"tall pet drawn full length ({w}x{h})"
+            # no choice file falls back to the default pet
+            ab.PET_CHOICE_PATH = os.path.join(tmp, "nope")
+            assert ab.pet_name() == ab.DEFAULT_PET
+        finally:
+            ab.PET_DIRS, ab.PET_CHOICE_PATH, ab.PET_DIR, ab.HIDE_PET_FLAG = saved
+    print("ok   a local pet folder supplies the sheet and the name")
 
-        # hidden pet, or no Codex at all, falls back to the glyph alone
-        open(ab.HIDE_PET_FLAG, "w").close()
-        assert ab.title_icon("calm") == ab.ICON
-    print(f"ok   title icon carries both marks ({w}x{h}), falls back to the glyph")
 
-
-def test_title_cache_tracks_the_sheet(ab):
-    """A new sprite sheet must invalidate the composite, not only the frame.
-
-    title_icon originally keyed on (name, mood, version) and left out the asar's
-    mtime that pet_icon keys on, so a Codex update regenerated the frame while
-    the composite kept serving the old one indefinitely.
-    """
-    if not os.path.exists(ab.CODEX_ASAR):
-        print("skip title cache (Codex.app not installed)")
+def test_unknown_pet_is_remembered(ab):
+    """A pet name the app does not bundle must not re-read the archive every tick."""
+    if not ab.codex_asar():
+        print("skip unknown pet (no Codex app installed)")
         return
-    try:
-        import PIL  # noqa: F401
-    except ImportError:
-        print("skip title cache (Pillow not installed)")
-        return
-
     with tempfile.TemporaryDirectory() as tmp:
-        ab.PET_DIR = os.path.join(tmp, "pet")
-        ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
-        assert ab.title_icon("calm") != ab.ICON
-        stamp = str(int(os.path.getmtime(ab.CODEX_ASAR)))
-        titles = [n for n in os.listdir(ab.PET_DIR) if n.startswith("title-")]
-        assert titles, os.listdir(ab.PET_DIR)
-        assert stamp in titles[0], f"composite key carries no sheet stamp: {titles[0]}"
-    print("ok   composite cache is keyed on the sprite sheet too")
+        with open(os.path.join(tmp, "choice"), "w") as f:
+            f.write("no-such-pet-xyz")
+        saved = (ab.PET_CHOICE_PATH, ab.PET_DIR, ab.HIDE_PET_FLAG, ab.asar_lookup)
+        calls = []
+        try:
+            ab.PET_CHOICE_PATH = os.path.join(tmp, "choice")
+            ab.PET_DIR = os.path.join(tmp, "cache")
+            ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
+            real = ab.asar_lookup
+            ab.asar_lookup = lambda *a: calls.append(a) or real(*a)
+            assert ab.pet_icon("calm") is None
+            assert ab.pet_icon("calm") is None
+        finally:
+            ab.PET_CHOICE_PATH, ab.PET_DIR, ab.HIDE_PET_FLAG, ab.asar_lookup = saved
+    assert len(calls) == 1, f"archive read {len(calls)} times for a missing pet"
+    print("ok   a pet missing from the app is looked up once per app version")
 
 
 def test_missing_codex(ab):
-    ab.CODEX_ASAR = "/nope/Codex.app/Contents/Resources/app.asar"
+    ab.CODEX_ASARS = ("/nope/Codex.app/Contents/Resources/app.asar",)
+    ab.PET_DIRS = []
     ab.HIDE_PET_FLAG = "/nope/hide"
     assert ab.pet_icon("calm") is None
     print("ok   no Codex install means no pet, not an error")
@@ -235,7 +255,7 @@ if __name__ == "__main__":
     test_asar_lookup(ab)
     test_icons(ab)
     test_cache_and_optout(ab)
-    test_title_keeps_both_marks(ab)
-    test_title_cache_tracks_the_sheet(ab)
+    test_local_pet_folder(ab)
+    test_unknown_pet_is_remembered(ab)
     test_missing_codex(ab)  # mutates paths, so it runs last
     print("\nall checks passed")

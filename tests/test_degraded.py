@@ -36,6 +36,11 @@ def load(tmp, *, cswap=True, codex=True, partial_windows=False, stale=False):
     ab.PAUSE_FLAG = os.path.join(ab.CACHE_DIR, "paused")
     ab.CSWAP_ROOT = os.path.join(tmp, "cswap") if cswap else os.path.join(tmp, "gone")
     ab.CODEX_AUTH = os.path.join(tmp, "codex-auth.json") if codex else os.path.join(tmp, "gone.json")
+    # the pet choice and local pet folders live in the user's home: a Mac that
+    # picked another pet must not change what these renders assert on
+    ab.PET_CHOICE_PATH = os.path.join(tmp, "pet-choice")
+    ab.PET_DIRS = [os.path.join(tmp, "pets")]
+    ab.PET_DIR = os.path.join(ab.CACHE_DIR, "pet")
 
     ab.daemon_running = lambda: False
     ab.ccusage = lambda args: None
@@ -178,23 +183,19 @@ def test_claude_lane_is_claude_only():
 
 def test_codex_only():
     with tempfile.TemporaryDirectory() as tmp:
-        out = render(load(tmp, cswap=False, codex=True))
+        ab = load(tmp, cswap=False, codex=True)
+        out = render(ab)
+        ab.ROLE = "codex"
+        codex_title = render(ab).splitlines()[0]
     title = out.splitlines()[0]
     assert "⚠️" not in title, f"false daemon alarm for a Codex-only user: {title}"
-    assert "✳" in title, title
+    assert "12%" in codex_title, codex_title
+    assert "12%" not in title, f"Codex usage leaked into the Claude item: {title}"
     assert "Auto-switch" not in out, "cswap daemon lane drawn without cswap"
     assert "cswap dashboard" not in out, "cswap action drawn without cswap"
     assert "claude-swap not set up" in out, "no explanation for the missing Claude rows"
     assert "Codex · ChatGPT Pro" in out, "Codex lane missing"
     assert "12% used" in out, "Codex gauge missing"
-
-    # The title carries the Claude glyph AND the pet; the pet's own row must
-    # carry only the pet, or his name gets the Claude mark pasted in front of it.
-    seedy = [l for l in out.splitlines() if "Seedy ·" in l]
-    if seedy:
-        row_img = seedy[0].split("image=")[1].split()[0]
-        title_img = title.split("image=")[1].split()[0]
-        assert row_img != title_img, "the pet's own row is drawing the composite"
     print("ok   Codex-only: Codex draws, no false claude-swap alarm")
 
 
@@ -202,7 +203,6 @@ def test_claude_only():
     with tempfile.TemporaryDirectory() as tmp:
         out = render(load(tmp, cswap=True, codex=False))
     title = out.splitlines()[0]
-    assert "✳" not in title, f"Codex shown in title with no Codex: {title}"
     assert "40%·55%" in title, title
     assert "Codex · not signed in" in out, "no hint about signing in to Codex"
     assert "Auto-switch" in out, "cswap lane missing when cswap is present"
@@ -213,7 +213,7 @@ def test_claude_only():
 def test_neither():
     with tempfile.TemporaryDirectory() as tmp:
         out = render(load(tmp, cswap=False, codex=False))
-    assert out.splitlines()[0].strip().startswith("•"), out.splitlines()[0]
+    assert "%" not in out.splitlines()[0], out.splitlines()[0]
     assert "⚠️" not in out.splitlines()[0]
     assert "---" in out, "menu body missing entirely"
     print("ok   Neither configured: still renders a sane, quiet menu")
