@@ -114,8 +114,10 @@ HIDE_PET_FLAG = os.path.join(CACHE_DIR, "hide-pet")
 # Bump when the crop changes shape: moods, cell geometry or bar height. The
 # cache key is the sheet's mtime, which does not move when this file does, so
 # without it a fix would never reach anyone who already has cached frames.
-PET_CACHE_VERSION = 2
+PET_CACHE_VERSION = 3
 DEFAULT_PET = "seedy"
+# Height of the bust cropped from a tall pet, as a multiple of its width.
+PET_BUST_RATIO = 1.3
 PET_BAR_PX = 36  # 18pt at 144 dpi, matching ICON. See the dpi= on save().
 # Frame geometry read off the sheet the Codex app animates. Columns and cell
 # height have been stable across sprite versions; a sheet that does not divide
@@ -895,6 +897,10 @@ def pet_icon(mood):
             return None
         cell = sheet.crop((col * cw, row * PET_CELL_H, (col + 1) * cw, (row + 1) * PET_CELL_H))
         cell = cell.crop(cell.getbbox() or (0, 0, cw, PET_CELL_H))
+        if cell.height > 2 * cell.width:
+            # a standing figure scaled to 18pt leaves its face a few points
+            # high; head and shoulders read as the character, a stick does not
+            cell = cell.crop((0, 0, cell.width, round(cell.width * PET_BUST_RATIO)))
         scale = PET_BAR_PX / cell.height
         cell = cell.resize(
             (max(1, round(cell.width * scale)), PET_BAR_PX), Image.NEAREST
