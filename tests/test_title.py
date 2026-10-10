@@ -166,6 +166,29 @@ def test_each_item_wears_its_own_mark():
     print("ok   Claude glyph on the Claude item, the pet or a Codex mark on the Codex item")
 
 
+def test_paired_items_refresh_once():
+    """Both items tick together; the second must reuse the first's fresh stats."""
+    import threading
+    import time
+    with tempfile.TemporaryDirectory() as tmp:
+        ab = load(tmp)
+        calls = []
+
+        def slow(args):
+            calls.append(args[-1])
+            time.sleep(0.3)
+            return {"daily": []} if args[-1] == "daily" else {"blocks": []}
+
+        ab.ccusage = slow
+        threads = [threading.Thread(target=ab.refresh_stats) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert calls.count("daily") == 1, calls
+    print("ok   two items starting together run ccusage once")
+
+
 def test_role_follows_the_file_name():
     with tempfile.TemporaryDirectory() as tmp:
         ab = load(tmp)
@@ -184,5 +207,6 @@ if __name__ == "__main__":
     test_claude_only_install_keeps_spend()
     test_no_colored_dot()
     test_each_item_wears_its_own_mark()
+    test_paired_items_refresh_once()
     test_role_follows_the_file_name()
     print("\nall checks passed")
