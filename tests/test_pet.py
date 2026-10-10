@@ -202,6 +202,11 @@ def test_local_pet_folder(ab):
             assert all(frames.values()), frames
             assert len(set(frames.values())) == len(frames), "moods are not distinct frames"
             assert all(png_size(f)[1] == ab.PET_BAR_PX for f in frames.values())
+            # these figures are over twice as tall as wide: at 18pt a full body
+            # leaves the face a few points high, so the bar shows a bust instead
+            for frame in frames.values():
+                w, h = png_size(frame)
+                assert 2 * w > h, f"tall pet drawn full length ({w}x{h})"
             # no choice file falls back to the default pet
             ab.PET_CHOICE_PATH = os.path.join(tmp, "nope")
             assert ab.pet_name() == ab.DEFAULT_PET
