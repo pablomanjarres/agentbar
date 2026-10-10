@@ -155,6 +155,9 @@ def role_for(path):
 
 
 ROLE = role_for(__file__)
+# Where the Codex item would sit beside this one; without it, the Claude item
+# carries the spend so a single-item install does not lose it.
+SIBLING_CODEX_ITEM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentbar-codex.1m.py")
 
 ENV = dict(os.environ)
 ENV["PATH"] = ":".join(
@@ -1688,16 +1691,18 @@ def main():
     # ONE title line per item. SwiftBar cycles multiple title lines in the bar
     # but also repeats every one of them at the top of the dropdown, so a second
     # line showed the icon and its text twice over. Spend rides along on the
-    # Codex item, the rightmost of the pair, and the hourly burn stays in the
-    # Block row below where it has room.
+    # Codex item, the rightmost of the pair, or on the Claude item when it is
+    # installed alone. The hourly burn stays in the Block row below.
+    spent = (today or {}).get("cost", 0) + codex_today
+    money_bit = f"  ${spent:,.0f}" if spent else ""
     if ROLE == "codex":
-        spent = (today or {}).get("cost", 0) + codex_today
         codex_bit = f"{max(codex_pcts):.0f}%" if codex_pcts else "–"
-        money_bit = f"  ${spent:,.0f}" if spent else ""
         mark = f"image={pet}" if pet else f"sfimage={CODEX_SFIMAGE}"
         print(f"{codex_bit}{money_bit} | {mark}")
     else:
-        print(f"{prefix}{claude_bit} | image={ICON}")
+        if os.path.lexists(SIBLING_CODEX_ITEM):
+            money_bit = ""
+        print(f"{prefix}{claude_bit}{money_bit} | image={ICON}")
     print("---")
 
     # ---- accounts ----
