@@ -152,6 +152,8 @@ def test_each_item_wears_its_own_mark():
         summary = ab.codex_summary()
         summary["today"] = {"cost": 3.0, "tokens": 100}
         ab.codex_summary = lambda: summary
+        ab.SIBLING_CODEX_ITEM = os.path.join(tmp, "agentbar-codex.1m.py")
+        open(ab.SIBLING_CODEX_ITEM, "w").close()
         claude = render(ab).splitlines()[0]
         ab.ROLE = "codex"
         codex = render(ab).splitlines()[0]
