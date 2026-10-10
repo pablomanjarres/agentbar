@@ -844,8 +844,9 @@ def pet_sheet(name):
     folder, meta = pet_folder(name)
     rel = meta.get("spritesheetPath") or meta.get("spritesheet")
     if folder and rel:
-        path = os.path.join(folder, os.path.basename(rel))
-        if os.path.isfile(path):
+        path = os.path.realpath(os.path.join(folder, rel))
+        inside = path.startswith(os.path.realpath(folder) + os.sep)
+        if inside and os.path.isfile(path):
             return path, lambda: read_bytes(path)
     asar = codex_asar()
     if asar:
