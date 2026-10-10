@@ -73,6 +73,9 @@ def test_no_colored_dot():
 def test_each_item_wears_its_own_mark():
     with tempfile.TemporaryDirectory() as tmp:
         ab = load(tmp, codex=True)
+        summary = ab.codex_summary()
+        summary["today"] = {"cost": 3.0, "tokens": 100}
+        ab.codex_summary = lambda: summary
         claude = render(ab).splitlines()[0]
         ab.ROLE = "codex"
         codex = render(ab).splitlines()[0]
