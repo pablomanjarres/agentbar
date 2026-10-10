@@ -32,6 +32,7 @@ def load(tmp, *, cswap=True, codex=True, partial_windows=False, stale=False):
     ab.ADMIN_KEY_PATH = os.path.join(ab.SECRETS_DIR, "none")
     ab.CLAUDE_SETTINGS = os.path.join(tmp, "settings.json")
     ab.HIDE_EMAILS_FLAG = os.path.join(ab.CACHE_DIR, "hide")
+    ab.HIDDEN_ACCOUNTS_PATH = os.path.join(tmp, "hidden-accounts.json")
     ab.PAUSE_FLAG = os.path.join(ab.CACHE_DIR, "paused")
     ab.CSWAP_ROOT = os.path.join(tmp, "cswap") if cswap else os.path.join(tmp, "gone")
     ab.CODEX_AUTH = os.path.join(tmp, "codex-auth.json") if codex else os.path.join(tmp, "gone.json")
@@ -225,7 +226,7 @@ def test_partial_claude_windows():
     title = out.splitlines()[0]
     assert "40%" in title, title
     assert "·55%" not in title, title
-    assert "Claude Max accounts" in out, "menu body did not render"
+    assert "Claude accounts" in out, "menu body did not render"
     print("ok   half-reported Claude windows still render the title")
 
 

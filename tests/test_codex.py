@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Checks for the Codex lane. Run: python3 tests/test_codex.py [--live]
 
-The pure-arithmetic checks always run. The scan checks read whatever is in
-~/.codex and skip themselves when Codex was never used on this machine. --live
-adds one call to the ChatGPT usage endpoint.
+Arithmetic and scan-cache checks use controlled inputs. The rollout delta check
+reads ~/.codex and skips itself when no sessions exist. --live adds one call to
+the ChatGPT usage endpoint.
 """
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -89,6 +90,36 @@ def test_cost(ab):
     assert astra is not None, "gpt-6-astra has no shipped price"
     assert abs(astra - 10.5) < 1e-9, astra
     print("ok   cached input billed as a slice, unpriced models return None")
+
+
+def test_new_model_prices(ab):
+    # Each mixed case has 0.5M fresh input, 0.5M cached input, and 0.1M output.
+    # Sol: 1 + .1 + 1 = 2.1; Sol 6.1: 1 + .05 + 1 = 2.05;
+    # Luna: .05 + .005 + .05 = .105. All-cached input isolates the cache rate.
+    cases = (
+        ("gpt-6-sol", 2.1, 0.20, 2.0, 1.0),
+        ("gpt-6.1-sol", 2.05, 0.10, 2.0, 1.0),
+        ("gpt-6-luna", 0.105, 0.01, 0.1, 0.05),
+    )
+    for model, mixed_expected, cached_expected, fresh_expected, output_expected in cases:
+        mixed = ab.codex_cost(
+            model,
+            {"input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000},
+            ab.DEFAULT_CODEX_PRICES,
+        )
+        assert mixed is not None, f"{model} has no shipped price"
+        assert abs(mixed - mixed_expected) < 1e-9, (model, mixed)
+        cached = ab.codex_cost(
+            model,
+            {"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000, "output_tokens": 0},
+            ab.DEFAULT_CODEX_PRICES,
+        )
+        assert abs(cached - cached_expected) < 1e-9, (model, cached)
+        fresh = ab.codex_cost(model, {"input_tokens": 1_000_000}, ab.DEFAULT_CODEX_PRICES)
+        assert abs(fresh - fresh_expected) < 1e-9, (model, fresh)
+        output = ab.codex_cost(model, {"output_tokens": 100_000}, ab.DEFAULT_CODEX_PRICES)
+        assert abs(output - output_expected) < 1e-9, (model, output)
+    print("ok   new model spend uses published fresh, cached and output rates")
 
 
 def test_rollout_deltas(ab):
@@ -185,19 +216,51 @@ def test_history_imports_are_not_usage(ab):
 
 
 def test_scan_cache(ab):
-    t0 = time.time()
-    first = ab.codex_summary()
-    cold = time.time() - t0
-    t0 = time.time()
-    second = ab.codex_summary()
-    warm = time.time() - t0
-    assert first == second, "cached scan disagreed with the cold scan"
-    for scope in ("today", "month", "alltime"):
-        assert first[scope]["cost"] >= 0
-        assert first[scope]["tokens"] >= 0
-    assert first["alltime"]["tokens"] >= first["month"]["tokens"] >= first["today"]["tokens"]
-    assert first["alltime"]["cost"] + 1e-9 >= first["month"]["cost"]
-    print(f"ok   scan cache is stable and consistent (cold {cold:.2f}s, warm {warm:.2f}s)")
+    """An unchanged transcript has the same exact totals on cold and warm scans."""
+    import datetime
+
+    original = (ab.CODEX_SESSIONS, ab.CACHE_DIR, ab.CODEX_SCAN_PATH, ab.CODEX_PRICES_PATH)
+    today = datetime.date.today().isoformat()
+    stamp = datetime.datetime.now().astimezone().isoformat()
+    rows = [
+        {"timestamp": stamp, "type": "session_meta", "payload": {"id": "cache-fixture"}},
+        {"timestamp": stamp, "type": "turn_context", "payload": {"model": "gpt-5.5"}},
+    ]
+    for usage in (
+        {"input_tokens": 500_000, "cached_input_tokens": 250_000, "output_tokens": 50_000, "total_tokens": 550_000},
+        {"input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 100_000, "total_tokens": 1_100_000},
+    ):
+        rows.append({
+            "timestamp": stamp,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": usage}},
+        })
+    try:
+        with tempfile.TemporaryDirectory(prefix="agentbar-scan-test-") as scratch:
+            ab.CODEX_SESSIONS = os.path.join(scratch, "sessions")
+            ab.CACHE_DIR = os.path.join(scratch, "cache")
+            ab.CODEX_SCAN_PATH = os.path.join(ab.CACHE_DIR, "codex-scan.json")
+            ab.CODEX_PRICES_PATH = os.path.join(scratch, "prices.json")
+            os.makedirs(ab.CODEX_SESSIONS)
+            with open(os.path.join(ab.CODEX_SESSIONS, "rollout.jsonl"), "w") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+            first = ab.codex_summary()
+            cache_mtime = os.stat(ab.CODEX_SCAN_PATH).st_mtime_ns
+            second = ab.codex_summary()
+            assert first == second, "cached scan disagreed with the cold scan"
+            assert os.stat(ab.CODEX_SCAN_PATH).st_mtime_ns == cache_mtime
+            # The final cumulative reading, not the sum of both events, is billed.
+            assert first == {
+                "today": {"cost": 5.75, "tokens": 1_100_000},
+                "month": {"cost": 5.75, "tokens": 1_100_000},
+                "alltime": {"cost": 5.75, "tokens": 1_100_000, "days": 1},
+                "unpriced": [],
+                "last_day": today,
+            }, first
+    finally:
+        ab.CODEX_SESSIONS, ab.CACHE_DIR, ab.CODEX_SCAN_PATH, ab.CODEX_PRICES_PATH = original
+    print("ok   controlled transcript scan cache is stable with exact cumulative totals")
 
 
 def test_window_dedupe(ab):
@@ -297,6 +360,7 @@ def main():
     ab = load()
     test_labels(ab)
     test_cost(ab)
+    test_new_model_prices(ab)
     test_window_dedupe(ab)
     test_distinct_models_survive(ab)
     test_fetch_guards_shape_drift(ab)

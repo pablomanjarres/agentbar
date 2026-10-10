@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <swiftbar.hideAbout>true</swiftbar.hideAbout>
+# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
+# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
+# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
+# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 """SwiftBar plugin: one menu bar item for Claude Code and OpenAI Codex.
 
 Both agents answer the same two questions: how much of the rate-limit window
@@ -76,6 +81,8 @@ CODEX_SCAN_PATH = os.path.join(CACHE_DIR, "codex-scan.json")
 CODEX_SCAN_VERSION = 2
 CONFIG_DIR = os.path.join(HOME, ".config", "agentbar")
 CODEX_PRICES_PATH = os.path.join(CONFIG_DIR, "codex-prices.json")
+ACCOUNT_SETUP_CMD = os.path.join(CONFIG_DIR, "account-setup", "setup.command")
+HIDDEN_ACCOUNTS_PATH = os.path.join(CONFIG_DIR, "hidden-accounts.json")
 # Every documented /backend-api/codex/* usage path 403s; this is the one the CLI
 # itself reads, and it only answers with the originator header set.
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -422,6 +429,9 @@ def minor_to_usd(obj):
 # up in the unpriced warning row instead, the same way ccusage gaps do.
 DEFAULT_CODEX_PRICES = {
     "gpt-6-astra": {"in": 10.00, "cached": 1.00, "out": 50.00},
+    "gpt-6.1-sol": {"in": 2.00, "cached": 0.10, "out": 10.00},
+    "gpt-6-sol": {"in": 2.00, "cached": 0.20, "out": 10.00},
+    "gpt-6-luna": {"in": 0.10, "cached": 0.01, "out": 0.50},
     "gpt-5.6-sol": {"in": 4.00, "cached": 0.40, "out": 20.00},
     "gpt-5.6-terra": {"in": 2.00, "cached": 0.20, "out": 12.00},
     "gpt-5.6-luna": {"in": 0.20, "cached": 0.02, "out": 1.20},
@@ -1053,7 +1063,7 @@ def win_label(minutes):
     return f"{minutes}m"
 
 
-def print_gauges(windows):
+def print_gauges(windows, prefix=""):
     """One bar row per rate-limit window. Shared by the Claude and Codex lanes.
 
     Codex labels are wider than Claude's ("5.3-Codex-Spark 5h"), so the column
@@ -1070,7 +1080,7 @@ def print_gauges(windows):
             # Say so in grey rather than drawing a reassuring green bar.
             age = f" · {human_dur(w['age'])} old" if w.get("age") else ""
             print(
-                f"   {label:<{pad}} {'·' * 10} stale reading{age} "
+                f"{prefix}   {label:<{pad}} {'·' * 10} stale reading{age} "
                 f"| font=Menlo size=11 trim=false color={GRAY}"
             )
             continue
@@ -1079,16 +1089,16 @@ def print_gauges(windows):
             f"   {label:<{pad}} {bar(pct)} {pct:>3.0f}% used · "
             f"{100 - pct:.0f}% left · {reset}"
         )
-        print(f"{line} | font=Menlo size=11 trim=false color={state_color(pct)}")
+        print(f"{prefix}{line} | font=Menlo size=11 trim=false color={state_color(pct)}")
 
 
-def print_rows(rows):
+def print_rows(rows, prefix=""):
     """Label + value lines for a spend block."""
     for label, text in rows:
-        print(f"{label:<6} {text} | font=Menlo size=12 trim=false")
+        print(f"{prefix}{label:<6} {text} | font=Menlo size=12 trim=false")
 
 
-def print_unpriced(models, hint):
+def print_unpriced(models, hint, prefix=""):
     """Warn about models that burned tokens at $0.
 
     Their spend is missing from every total above, so the figure reads low with
@@ -1098,10 +1108,76 @@ def print_unpriced(models, hint):
     if not models:
         return
     print(
-        f"⚠ {', '.join(models)}: no price — spend above is too low "
+        f"{prefix}⚠ {', '.join(models)}: no price — spend above is too low "
         f"| size=11 color={ORANGE} trim=false"
     )
-    print(f"   {hint} | size=11 color={GRAY} trim=false")
+    print(f"{prefix}   {hint} | size=11 color={GRAY} trim=false")
+
+
+def spend_rows(totals):
+    """Common daily, monthly and lifetime details for a spend summary."""
+    rows = []
+    for key, label in (("today", "Today"), ("month", "Month"), ("alltime", "Total")):
+        value = totals.get(key)
+        if not value:
+            continue
+        detail = money(value.get("cost") or 0)
+        if "tokens" in value:
+            detail += f" · {tokens_h(value['tokens'])} tok"
+        if value.get("days"):
+            detail += f" · {value['days']}d"
+        rows.append((label, detail))
+    return rows
+
+
+def print_spend_summary(label, totals, rows, *, unpriced=(), hint="", empty="not available yet"):
+    """One summary row with its full metrics and warnings in a submenu."""
+    warning = " ⚠" if unpriced else ""
+    if not totals:
+        print(f"{label}{warning}  {empty} | size=12 color={GRAY}")
+    else:
+        today = (totals.get("today") or {}).get("cost") or 0
+        month = (totals.get("month") or {}).get("cost") or 0
+        print(f"{label}{warning}  {money(today)} today · {money(month)} month | size=12")
+        print_rows(rows, prefix="--")
+    print_unpriced(unpriced, hint, prefix="--")
+
+
+def print_spend(stats):
+    """Compose compact provider summaries without discarding their details."""
+    print(f"API-equivalent spend · this Mac | size=11 color={GRAY}")
+    claude = {key: stats.get(key) for key in ("today", "month", "alltime")}
+    if not (claude["today"] or claude["alltime"]):
+        claude = {}
+    codex = stats.get("codex_spend") or {}
+    if not (codex.get("alltime") or {}).get("days"):
+        codex = {}
+    rows = spend_rows(claude)
+    block = stats.get("block")
+    if claude and block:
+        rows.insert(1, (
+            "Block",
+            f"{money(block['cost'])} · {money(block['perHour'])}/hr → "
+            f"{money(block['projCost'])} by {local_clock(block.get('end') or '')}",
+        ))
+    elif claude and block is None and "fastAt" in stats:
+        rows.insert(1, ("Block", "no active 5h block"))
+    print_spend_summary(
+        "Claude", claude, rows, unpriced=stats.get("unpriced") or (),
+        hint="add it to pricingOverrides in ~/.claude/ccusage.json",
+    )
+    print_spend_summary(
+        "Codex", codex, spend_rows(codex),
+        unpriced=(stats.get("codex_spend") or {}).get("unpriced") or (),
+        hint=f"add a price in {CODEX_PRICES_PATH}", empty="no Codex sessions on this Mac",
+    )
+    both = {}
+    if claude or codex:
+        for key in ("today", "month", "alltime"):
+            values = [(provider.get(key) or {}) for provider in (claude, codex)]
+            both[key] = {field: sum(value.get(field) or 0 for value in values)
+                         for field in ("cost", "tokens")}
+    print_spend_summary("Both", both, spend_rows(both))
 
 
 def daemon_running():
@@ -1252,74 +1328,213 @@ def account_windows(lastgood):
     """Yield (label, window) for every rate-limit window an account has."""
     if not lastgood:
         return
+    standard = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         w = claude_window(lastgood.get(key))
         if w:
+            standard.append(w)
             yield label, w
     for scoped in lastgood.get("scoped") or []:
         w = claude_window(scoped)
         if w:
+            if not scoped.get("resets_at") and standard and all(v.get("stale") for v in standard):
+                w["stale"] = True
+                w["age"] = min(v.get("age") or 0 for v in standard)
             yield scoped.get("name", "model")[:5], w
 
 
+def print_account(num, meta, usage, active, hidden):
+    """One summary row, with full usage and manual switching in its submenu."""
+    email = meta.get("email", f"account {num}")
+    token_account = email.endswith("@token.local")
+    lastgood = usage.get("lastGood") or {}
+    windows = list(account_windows(lastgood))
+    summary = []
+    for label, window in windows:
+        if label not in ("5h", "7d"):
+            continue
+        value = "stale" if window.get("stale") else f"{window['pct']:.0f}%"
+        summary.append(f"{label} {value}")
+    if token_account:
+        summary = ["manual"]
+    elif not summary:
+        summary = ["no usage"]
+    error = usage.get("lastError")
+    if error and not token_account:
+        summary.append(f"⚠ {str(error)[:24]}")
+    is_active = num == active
+    circ = CIRCLED[num - 1] if 1 <= num <= 10 else str(num)
+    marker = " ← active" if is_active else ""
+    color = RUST if is_active else ORANGE if error else GRAY
+    print(
+        f"{circ} {display_email(email, hidden)}{marker} · {' · '.join(summary)} "
+        f"| color={color} size=12"
+    )
+    if token_account:
+        print(f"--API billing · excluded from auto-switch | size=11 color={GRAY}")
+    elif windows:
+        print_gauges(windows, prefix="--")
+    else:
+        print(f"--No usage data yet | size=11 color={GRAY}")
+    if error:
+        print(f"--⚠ {str(error)[:60]} | size=11 color={ORANGE}")
+    if is_active:
+        print(f"--Current account | size=11 color={RUST}")
+    else:
+        print_actions([("Switch to this account", f"bash={PLUGIN} param1=switch param2={num} terminal=false refresh=true size=12")])
+
+
+def print_actions(actions, prefix="--"):
+    """Render action labels and their existing command attributes at one level."""
+    for label, attributes in actions:
+        print(f"{prefix}{label} | {attributes}")
+
+
 def print_daemon(daemon, hidden):
-    """The claude-swap auto-switch lane. Only drawn when cswap is set up."""
+    """One visible status row; controls and diagnostics stay in its submenu."""
+    details = []
     if auto_paused():
-        print(f"Auto-switch: PAUSED (you turned it off) | color={ORANGE} size=12")
-        print(
-            f"   stays on the current account until you resume | size=11 color={GRAY} trim=false"
-        )
-        print(
-            f"▶ Resume auto-switch | bash={PLUGIN} param1=resume-auto "
-            f"terminal=false refresh=true size=12 color={GREEN}"
-        )
+        status, color = "paused", ORANGE
+        details.append(("Stays on the current account until resumed", GRAY))
+        actions = [(
+            "Resume auto-switch",
+            f"bash={PLUGIN} param1=resume-auto terminal=false refresh=true size=12 color={GREEN}",
+        )]
     elif daemon:
         last, last_switch = last_log_events()
-        detail = ""
         if last:
             try:
                 ts = datetime.datetime.fromisoformat(
                     last["ts"].replace("Z", "+00:00")
                 ).timestamp()
-                detail = f" · last check {rel_age(ts)}"
+                details.append((f"Last checked {rel_age(ts)}", GRAY))
             except Exception:
                 pass
-        # A live process is not a working one. cswap kept ticking for two weeks
-        # while every tick died on an OverflowError, and this row stayed green
-        # the whole time because it only checked that the daemon existed.
-        failing = (last or {}).get("event") == "error"
-        if failing:
-            print(f"Auto-switch: running but FAILING{detail} | color={RED} size=12")
-            print(
-                f"   {str((last or {}).get('message'))[:70]} | "
-                f"size=11 color={ORANGE} trim=false"
-            )
+        # Health follows the last tick, rather than process existence alone.
+        if (last or {}).get("event") == "error":
+            status, color = "FAILING", RED
+            details.append((str((last or {}).get("message"))[:70], ORANGE))
+        elif (last or {}).get("reason") == "unmanaged-active-account":
+            status, color = "login not connected", ORANGE
+            details.append(("Connect the current Claude login to enable switching", GRAY))
         else:
-            print(f"Auto-switch: running{detail} | color={GREEN} size=12")
+            status, color = "running", GREEN
         if last_switch:
             to = display_email((last_switch.get("to") or {}).get("email", "?"), hidden)
-            print(f"   last switch → {to} ({last_switch.get('ts', '')}) | size=11 color={GRAY} trim=false")
-        print(
-            f"⏸ Pause auto-switch (stay on this account) | bash={PLUGIN} param1=pause-auto "
-            f"terminal=false refresh=true size=12 color={ORANGE}"
-        )
+            details.append((f"Last switch → {to} ({last_switch.get('ts', '')})", GRAY))
+        actions = [(
+            "Pause auto-switch",
+            f"bash={PLUGIN} param1=pause-auto terminal=false refresh=true size=12 color={ORANGE}",
+        )]
     else:
-        print(f"Auto-switch daemon NOT running | color={RED} size=12")
+        status, color = "not running", RED
+        actions = [(
+            "Start auto-switch",
+            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} terminal=false refresh=true size=12",
+        )]
+    print(f"Auto-switch: {status} | color={color} size=12")
+    print_actions(actions)
+    for detail, detail_color in details:
+        print(f"--{detail} | size=11 color={detail_color} trim=false")
+
+
+def print_billing(stats, active_email):
+    """Billing details belong under Settings, including optional setup hints."""
+    whose = f" · {active_email}" if active_email else ""
+    print(f"--Credits & billing{whose} | size=12")
+    credits = stats.get("credits")
+    if credits:
+        sp = credits.get("spend") or {}
+        eu = credits.get("extra_usage") or {}
+        if sp.get("enabled"):
+            used = minor_to_usd(sp.get("used"))
+            line = f"Usage credits: {money(used or 0)} used"
+            bal = minor_to_usd(sp.get("balance"))
+            if bal is not None:
+                line += f" · balance {money(bal)}"
+            if sp.get("percent"):
+                line += f" ({sp['percent']}%)"
+            color = state_color(float(sp.get("percent") or 0))
+            print(f"----{line} | font=Menlo size=12 trim=false color={color}")
+        else:
+            print(f"----Usage credits: off | size=12 color={GRAY}")
+        if eu.get("is_enabled"):
+            used = eu.get("used_credits")
+            dp = eu.get("decimal_places")
+            shown = money(used / 10 ** dp) if used is not None and dp else str(used)
+            line = f"Extra usage: {shown} used"
+            if eu.get("monthly_limit"):
+                lim = eu["monthly_limit"] / 10 ** dp if dp else eu["monthly_limit"]
+                line += f" of {money(lim) if dp else lim}"
+            print(f"----{line} | font=Menlo size=12 trim=false")
+        else:
+            print(f"----Extra usage: off | size=12 color={GRAY}")
+    else:
+        print(f"----Credit state unavailable | size=11 color={GRAY}")
+    api_cost = stats.get("api_cost")
+    if api_cost is None:
         print(
-            f"   ↳ start: launchctl kickstart {AUTO_TARGET} | "
-            f"bash=/bin/launchctl param1=kickstart param2={AUTO_TARGET} "
-            f"terminal=false refresh=true size=11 trim=false"
+            f"----API credits (Console): not tracked · add admin key to "
+            f"~/.swiftbar/.secrets/anthropic-admin-key | size=11 color={GRAY}"
         )
+    elif api_cost.get("error"):
+        print(f"----API credits (Console): fetch failed ({api_cost['error']}) | size=11 color={ORANGE}")
+    else:
+        print(
+            f"----API credits (Console): {money(api_cost['month_usd'])} this month "
+            f"| font=Menlo size=12 trim=false"
+        )
+
+
+def print_settings(stats, has_cswap, hidden, active_email):
+    """Less frequent controls share one Settings submenu."""
+    print("Settings | size=12")
+    pet_label = "Show the Codex pet" if os.path.exists(HIDE_PET_FLAG) else "Hide the Codex pet"
+    toggle_label = "Show emails" if hidden else "Hide emails"
+    actions = [
+        ("Refresh stats now", f"bash={PLUGIN} param1=refresh-stats terminal=false refresh=true"),
+        (toggle_label, f"bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"),
+        (pet_label, f"bash={PLUGIN} param1=toggle-pet terminal=false refresh=true"),
+    ]
+    if has_cswap:
+        actions.append((
+            "Open cswap dashboard (TUI)", f"bash=/usr/bin/open param1={TUI_CMD} terminal=false",
+        ))
+    if os.path.isfile(ACCOUNT_SETUP_CMD):
+        actions.append((
+            "Connect Claude accounts", f"bash=/usr/bin/open param1={ACCOUNT_SETUP_CMD} terminal=false",
+        ))
+    actions.append((
+        "Open Codex usage settings",
+        "bash=/usr/bin/open param1=https://chatgpt.com/codex/settings/usage terminal=false",
+    ))
+    print_actions(actions)
+    print_billing(stats, active_email)
+    print("--Diagnostics | size=12")
+    diagnostics = []
+    if has_cswap:
+        diagnostics.append(("Open auto-switch log", f"bash=/usr/bin/open param1={AUTO_LOG} terminal=false"))
+    diagnostics.append((
+        "Rebuild spend ledger",
+        f"bash={PLUGIN} param1=rebuild-ledger terminal=false refresh=true alternate=true",
+    ))
+    print_actions(diagnostics, prefix="----")
+    print(f"----Updates every minute | size=11 color={GRAY}")
 
 
 def main():
     ensure_tui_command()
     seq = load_json(os.path.join(CSWAP_ROOT, "sequence.json")) or {}
     usage = (load_json(os.path.join(CSWAP_ROOT, "cache", "usage.json")) or {}).get("accounts", {})
-    accounts = seq.get("accounts", {})
+    excluded = {str(n) for n in (load_json(HIDDEN_ACCOUNTS_PATH) or {}).get("accounts", [])}
+    accounts = {n: meta for n, meta in seq.get("accounts", {}).items() if n not in excluded}
     active = seq.get("activeAccountNumber")
-    order = seq.get("sequence") or sorted(int(k) for k in accounts)
+    if str(active) not in accounts:
+        active = None
+    order = [n for n in (seq.get("sequence") or sorted(int(k) for k in accounts)) if str(n) in accounts]
     daemon = daemon_running()
+    if daemon and (last_log_events()[0] or {}).get("reason") == "unmanaged-active-account":
+        active = None
     # Claude account gauges, the switcher and the daemon lane all come from
     # claude-swap. Codex-only users have none of it, and telling them a daemon
     # they never installed is down is a false alarm, so those lanes stay hidden.
@@ -1383,39 +1598,13 @@ def main():
 
     # ---- accounts ----
     if has_cswap:
-        print(f"Claude Max accounts · active window used (5h·7d) | size=11 color={GRAY}")
+        print(f"Claude accounts · active window used (5h·7d) | size=11 color={GRAY}")
     else:
         print(
             f"Claude accounts · claude-swap not set up, gauges off | size=11 color={GRAY}"
         )
     for num in order:  # empty when claude-swap has no accounts
-        meta = accounts.get(str(num), {})
-        email = meta.get("email", f"account {num}")
-        is_active = num == active
-        u = usage.get(str(num), {})
-        lastgood = u.get("lastGood")
-        circn = CIRCLED[num - 1] if num <= 10 else str(num)
-        is_token_acct = email.endswith("@token.local")
-        marker = "  ← active" if is_active else ""
-        color = f" color={RUST}" if is_active else ""
-        print(f"{circn} {display_email(email, hidden)}{marker} |{color} size=13")
-        if is_token_acct:
-            print(
-                f"   API billing · excluded from auto-switch · manual only "
-                f"| size=11 color={GRAY} trim=false"
-            )
-        if lastgood:
-            print_gauges(account_windows(lastgood))
-            err = u.get("lastError")
-            if err:
-                print(f"   ⚠ {str(err)[:60]} | size=11 color={ORANGE} trim=false")
-        elif not is_token_acct:
-            print(f"   no usage data yet | size=11 color={GRAY} trim=false")
-        if not is_active:
-            print(
-                f"   ↳ switch to this account | bash={PLUGIN} param1=switch "
-                f"param2={num} terminal=false refresh=true size=11 trim=false"
-            )
+        print_account(num, accounts.get(str(num), {}), usage.get(str(num), {}), active, hidden)
 
     # ---- codex / chatgpt account ----
     print("---")
@@ -1460,165 +1649,17 @@ def main():
 
     # ---- spend stats ----
     print("---")
-    print(f"API-equivalent spend · this Mac | size=11 color={GRAY}")
-    month = stats.get("month")
-    alltime = stats.get("alltime")
-    print(f"Claude Code | size=11 color={GRAY}")
-    if today or alltime:
-        rows = []
-        if today:
-            rows.append(("Today", f"{money(today['cost'])} · {tokens_h(today['tokens'])} tok"))
-        if block:
-            rows.append(
-                (
-                    "Block",
-                    f"{money(block['cost'])} · {money(block['perHour'])}/hr → "
-                    f"{money(block['projCost'])} by {local_clock(block.get('end') or '')}",
-                )
-            )
-        elif block is None and "fastAt" in stats:
-            rows.append(("Block", "no active 5h block"))
-        if month:
-            rows.append(("Month", money(month["cost"])))
-        if alltime:
-            rows.append(
-                (
-                    "Total",
-                    f"{money(alltime['cost'])} · {tokens_h(alltime['tokens'])} tok "
-                    f"· {alltime['days']}d",
-                )
-            )
-        print_rows(rows)
-        print_unpriced(
-            stats.get("unpriced"), "add it to pricingOverrides in ~/.claude/ccusage.json"
-        )
-    else:
-        print(f"   not available yet (ccusage) | size=11 color={GRAY}")
-
-    codex_spend = stats.get("codex_spend") or {}
-    print(f"Codex · ChatGPT | size=11 color={GRAY}")
-    if (codex_spend.get("alltime") or {}).get("days"):
-        print_rows(
-            [
-                (
-                    "Today",
-                    f"{money(codex_spend['today']['cost'])} · "
-                    f"{tokens_h(codex_spend['today']['tokens'])} tok",
-                ),
-                (
-                    "Month",
-                    f"{money(codex_spend['month']['cost'])} · "
-                    f"{tokens_h(codex_spend['month']['tokens'])} tok",
-                ),
-                (
-                    "Total",
-                    f"{money(codex_spend['alltime']['cost'])} · "
-                    f"{tokens_h(codex_spend['alltime']['tokens'])} tok "
-                    f"· {codex_spend['alltime']['days']}d",
-                ),
-            ]
-        )
-        print_unpriced(
-            codex_spend.get("unpriced"), f"add a price in {CODEX_PRICES_PATH}"
-        )
-    else:
-        print(f"   no Codex sessions on this Mac | size=11 color={GRAY}")
-
-    # the two numbers that answer "what have these agents cost me", combined
-    both_month = ((month or {}).get("cost") or 0) + (
-        (codex_spend.get("month") or {}).get("cost") or 0
-    )
-    claude_all = alltime or {}
-    codex_all = codex_spend.get("alltime") or {}
-    both_all = (claude_all.get("cost") or 0) + (codex_all.get("cost") or 0)
-    both_tokens = (claude_all.get("tokens") or 0) + (codex_all.get("tokens") or 0)
-    if both_all or both_month:
-        print(f"Both agents | size=11 color={GRAY}")
-        print(f"{'Month':<6} {money(both_month)} | font=Menlo size=12 trim=false")
-        print(
-            f"{'Total':<6} {money(both_all)} · {tokens_h(both_tokens)} tok "
-            f"| font=Menlo size=12 color={RUST} trim=false"
-        )
-
-    # ---- credits & billing lanes ----
-    print("---")
-    active_email = display_email(accounts.get(str(active), {}).get("email", "?"), hidden)
-    whose = f" · {active_email}" if has_cswap else ""
-    print(f"Credits & billing{whose} | size=11 color={GRAY}")
-    credits = stats.get("credits")
-    if credits:
-        sp = credits.get("spend") or {}
-        eu = credits.get("extra_usage") or {}
-        if sp.get("enabled"):
-            used = minor_to_usd(sp.get("used"))
-            line = f"Usage credits: {money(used or 0)} used"
-            bal = minor_to_usd(sp.get("balance"))
-            if bal is not None:
-                line += f" · balance {money(bal)}"
-            if sp.get("percent"):
-                line += f" ({sp['percent']}%)"
-            color = state_color(float(sp.get("percent") or 0))
-            print(f"{line} | font=Menlo size=12 trim=false color={color}")
-        else:
-            print(f"Usage credits: off | size=12 color={GRAY}")
-        if eu.get("is_enabled"):
-            used = eu.get("used_credits")
-            dp = eu.get("decimal_places")
-            shown = money(used / 10 ** dp) if used is not None and dp else str(used)
-            line = f"Extra usage: {shown} used"
-            if eu.get("monthly_limit"):
-                lim = eu["monthly_limit"] / 10 ** dp if dp else eu["monthly_limit"]
-                line += f" of {money(lim) if dp else lim}"
-            print(f"{line} | font=Menlo size=12 trim=false")
-        else:
-            print(f"Extra usage: off | size=12 color={GRAY}")
-    else:
-        print(f"credit state unavailable | size=11 color={GRAY}")
-    api_cost = stats.get("api_cost")
-    if api_cost is None:
-        print(
-            f"API credits (Console): not tracked · add admin key to "
-            f"~/.swiftbar/.secrets/anthropic-admin-key | size=11 color={GRAY}"
-        )
-    elif api_cost.get("error"):
-        print(f"API credits (Console): fetch failed ({api_cost['error']}) | size=11 color={ORANGE}")
-    else:
-        print(
-            f"API credits (Console): {money(api_cost['month_usd'])} this month "
-            f"| font=Menlo size=12 trim=false"
-        )
+    print_spend(stats)
 
     # ---- auto-switch daemon ----
     if has_cswap:
         print("---")
         print_daemon(daemon, hidden)
 
-    # ---- actions ----
+    # ---- settings ----
     print("---")
-    pet_label = "Show the Codex pet" if os.path.exists(HIDE_PET_FLAG) else "Hide the Codex pet"
-    print(f"{pet_label} | bash={PLUGIN} param1=toggle-pet terminal=false refresh=true")
-    toggle_label = "Show emails" if hidden else "Hide emails"
-    print(
-        f"{toggle_label} | bash={PLUGIN} param1=toggle-emails terminal=false refresh=true"
-    )
-    if has_cswap:
-        print(
-            f"Open cswap dashboard (TUI) | bash=/usr/bin/open param1={TUI_CMD} terminal=false"
-        )
-    print(
-        f"Open Codex usage settings | bash=/usr/bin/open "
-        f"param1=https://chatgpt.com/codex/settings/usage terminal=false"
-    )
-    if has_cswap:
-        print(f"Open auto-switch log | bash=/usr/bin/open param1={AUTO_LOG} terminal=false")
-    print(
-        f"Refresh stats now | bash={PLUGIN} param1=refresh-stats terminal=false refresh=true"
-    )
-    print(
-        f"Rebuild spend ledger | bash={PLUGIN} param1=rebuild-ledger "
-        f"terminal=false refresh=true alternate=true"
-    )
-    print(f"claude-swap + ccusage + codex · updates every 1m | size=10 color={GRAY}")
+    active_email = display_email(accounts.get(str(active), {}).get("email", "?"), hidden) if has_cswap else ""
+    print_settings(stats, has_cswap, hidden, active_email)
 
 
 if __name__ == "__main__":
