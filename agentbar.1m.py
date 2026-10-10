@@ -87,7 +87,10 @@ HIDDEN_ACCOUNTS_PATH = os.path.join(CONFIG_DIR, "hidden-accounts.json")
 # itself reads, and it only answers with the originator header set.
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_UA = "codex_cli_rs/0.142.5"
-CODEX_MARK = "\u2733"  # the mark next to Claude's circled number in the title
+# Drawn in place of the pet on the Codex item when no pet can be drawn. An SF
+# Symbol rather than a logo: the item still reads as "the coding agent" and
+# nothing of OpenAI's ships in this file.
+CODEX_SFIMAGE = "chevron.left.forwardslash.chevron.right"
 
 # --- the Codex pet ---------------------------------------------------------
 # Codex ships desktop "pets": one sprite sheet per pet inside the app's asar.
@@ -128,6 +131,21 @@ PET_CAPTIONS = {
     "strained": "running low",
     "spent": "out of window",
 }
+
+
+
+def role_for(path):
+    """Which menu bar item this copy renders, from the name it was run under.
+
+    SwiftBar gives each plugin one item with one image, and each agent wants
+    its own mark beside its own number. So the plugin is installed twice: as
+    agentbar.1m.py for Claude, and as a symlink agentbar-codex.1m.py for Codex.
+    Both draw the same menu; only the title differs.
+    """
+    return "codex" if os.path.basename(path).startswith("agentbar-codex") else "claude"
+
+
+ROLE = role_for(__file__)
 
 ENV = dict(os.environ)
 ENV["PATH"] = ":".join(
@@ -1595,28 +1613,29 @@ def main():
     # an account can report one window without the other; format whatever is there
     shown = [f"{pct:.0f}%" for pct in (p5, p7) if pct is not None]
     claude_bit = "·".join(shown) if shown else "–"
-    # both agents share one title line so neither is hidden behind a cycle
-    codex_bit = f"  {CODEX_MARK} {max(codex_pcts):.0f}%" if codex_pcts else ""
     today = stats.get("today")
     block = stats.get("block")
     codex_today = ((stats.get("codex_spend") or {}).get("today") or {}).get("cost") or 0
-    # the pet reacts to whichever agent is closest to its wall. limit_reached
-    # gets the same freshness gate as the windows: once they have all expired the
-    # cached flag describes a window that is already over.
-    busy = bool((block or {}).get("perHour")) or codex_today > 0
+    # limit_reached gets the same freshness gate as the windows: once they have
+    # all expired the cached flag describes a window that is already over.
+    busy = codex_today > 0
     hit_limit = bool((codex_usage or {}).get("limit_reached")) and bool(codex_wins)
     # the pet stands for Codex, so he reacts to Codex's own windows
     mood = pet_mood(max(codex_pcts) if codex_pcts else 0, busy, hit_limit)
-    # two images: the pair for the menu bar title, the pet alone for its own row
     pet = pet_icon(mood)
-    icon = title_icon(mood)
-    # ONE title line. SwiftBar cycles multiple title lines in the bar but also
-    # repeats every one of them at the top of the dropdown, so a second line
-    # showed the icon and its text twice over. Spend rides along here instead,
-    # and the hourly burn stays in the Block row below where it has room.
-    spent = (today or {}).get("cost", 0) + codex_today
-    money_bit = f"  ${spent:,.0f}" if spent else ""
-    print(f"{prefix}{claude_bit}{codex_bit}{money_bit} | image={icon}")
+    # ONE title line per item. SwiftBar cycles multiple title lines in the bar
+    # but also repeats every one of them at the top of the dropdown, so a second
+    # line showed the icon and its text twice over. Spend rides along on the
+    # Codex item, the rightmost of the pair, and the hourly burn stays in the
+    # Block row below where it has room.
+    if ROLE == "codex":
+        spent = (today or {}).get("cost", 0) + codex_today
+        codex_bit = f"{max(codex_pcts):.0f}%" if codex_pcts else "–"
+        money_bit = f"  ${spent:,.0f}" if spent else ""
+        mark = f"image={pet}" if pet else f"sfimage={CODEX_SFIMAGE}"
+        print(f"{codex_bit}{money_bit} | {mark}")
+    else:
+        print(f"{prefix}{claude_bit} | image={ICON}")
     print("---")
 
     # ---- accounts ----
