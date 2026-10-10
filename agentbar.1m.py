@@ -37,6 +37,7 @@ import base64
 import datetime
 import io
 import json
+import math
 import os
 import struct
 import subprocess
@@ -1384,41 +1385,77 @@ def account_windows(lastgood):
             yield scoped.get("name", "model")[:5], w
 
 
+def valid_cap(raw):
+    return isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) and 0 < raw <= 100
+
+
 def usage_caps(accounts):
     """Per-account usage cap in percent, from claude-swap's auto-switch policy.
 
     The daemon moves off an account once it reaches its cap, so a cap below 100
-    holds the rest of that account in reserve and it never drains fully.
+    holds the rest of that account in reserve and it never drains fully. The
+    validation mirrors claude-swap's AutoSwitchEngine.usage_cap exactly: any
+    cap the daemon would not honour reads as 100 here too.
     """
-    policy = load_json(os.path.join(CSWAP_ROOT, "autoswitch-policy.json")) or {}
-    default = float(policy.get("defaultUsageCap") or 100)
-    by_uuid = policy.get("accountUsageCaps") or {}
-    return {
-        num: float(by_uuid.get(meta.get("uuid") or "", default))
-        for num, meta in accounts.items()
-    }
+    policy = load_json(os.path.join(CSWAP_ROOT, "autoswitch-policy.json"))
+    if not isinstance(policy, dict) or policy.get("schemaVersion") != 1:
+        return {num: 100.0 for num in accounts}
+    by_uuid = policy.get("accountUsageCaps", {})
+    caps = {}
+    for num, meta in accounts.items():
+        if isinstance(by_uuid, dict):
+            raw = by_uuid.get(meta.get("uuid"), policy.get("defaultUsageCap", 100))
+        else:
+            raw = 100
+        caps[num] = float(raw) if valid_cap(raw) else 100.0
+    return caps
 
 
-def pooled_pct(accounts, usage, caps, key):
+def pool_members(seq, usage):
+    """Account numbers auto-switch can rotate onto right now.
+
+    The rotation is claude-swap's own `sequence`, so an account hidden from the
+    menu still counts. API-key accounts are billed per token, and an account
+    whose last refresh failed has no current reading to pool.
+    """
+    accounts = seq.get("accounts") or {}
+    members = []
+    for n in seq.get("sequence") or []:
+        num = str(n)
+        if num not in accounts or is_api_key_account(accounts[num].get("email")):
+            continue
+        if (usage.get(num) or {}).get("lastError"):
+            continue
+        members.append(num)
+    return members
+
+
+def pooled_pct(members, usage, caps, key):
     """One window's use across every account auto-switch rotates through.
 
     Each account adds its cap to the pool and its use, clamped to that cap, to
     the total: four accounts at 100% make a 400% pool, so one spent account
-    moves the number by 25% rather than to 100%. API-key accounts are billed per
-    token and stay out. A window whose reset has passed counts as unused. None
-    when no account has a live reading for this window at all.
+    moves the number by 25% rather than to 100%. An account that has hit its cap
+    on any window cannot serve at all, so it counts as spent here too. A window
+    whose reset has passed counts as unused; an account that does not report the
+    window stays out of it. None when no account has a live reading.
     """
     used = capacity = 0.0
     live = False
-    for num, meta in accounts.items():
-        if is_api_key_account(meta.get("email")):
-            continue
+    for num in members:
         cap = caps.get(num, 100.0)
-        capacity += cap
-        w = claude_window(((usage.get(num) or {}).get("lastGood") or {}).get(key))
-        if w and not w["stale"]:
+        good = (usage.get(num) or {}).get("lastGood") or {}
+        windows = {k: claude_window(good.get(k)) for k in ("five_hour", "seven_day")}
+        blocked = any(w and not w["stale"] and w["pct"] >= cap for w in windows.values())
+        w = windows[key]
+        if not w:
+            continue
+        if blocked:
+            used += cap
+        elif not w["stale"]:
             used += min(w["pct"], cap)
-            live = True
+        capacity += cap
+        live = live or blocked or not w["stale"]
     return used / capacity * 100 if live and capacity else None
 
 
@@ -1624,9 +1661,10 @@ def main():
     stats = refresh_stats(active_num=active)
 
     # ---- menu bar title ----
-    caps = usage_caps(accounts)
-    p5 = pooled_pct(accounts, usage, caps, "five_hour")
-    p7 = pooled_pct(accounts, usage, caps, "seven_day")
+    caps = usage_caps(seq.get("accounts") or {})
+    members = pool_members(seq, usage)
+    p5 = pooled_pct(members, usage, caps, "five_hour")
+    p7 = pooled_pct(members, usage, caps, "seven_day")
     codex_usage = stats.get("codex_usage")
     # a cached reading is kept across a failed refresh, so expired windows are
     # dropped before anything colours the menu bar off them
