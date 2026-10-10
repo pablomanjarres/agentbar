@@ -216,6 +216,30 @@ def test_local_pet_folder(ab):
     print("ok   a local pet folder supplies the sheet and the name")
 
 
+def test_unknown_pet_is_remembered(ab):
+    """A pet name the app does not bundle must not re-read the archive every tick."""
+    if not ab.codex_asar():
+        print("skip unknown pet (no Codex app installed)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "choice"), "w") as f:
+            f.write("no-such-pet-xyz")
+        saved = (ab.PET_CHOICE_PATH, ab.PET_DIR, ab.HIDE_PET_FLAG, ab.asar_lookup)
+        calls = []
+        try:
+            ab.PET_CHOICE_PATH = os.path.join(tmp, "choice")
+            ab.PET_DIR = os.path.join(tmp, "cache")
+            ab.HIDE_PET_FLAG = os.path.join(tmp, "hide-pet")
+            real = ab.asar_lookup
+            ab.asar_lookup = lambda *a: calls.append(a) or real(*a)
+            assert ab.pet_icon("calm") is None
+            assert ab.pet_icon("calm") is None
+        finally:
+            ab.PET_CHOICE_PATH, ab.PET_DIR, ab.HIDE_PET_FLAG, ab.asar_lookup = saved
+    assert len(calls) == 1, f"archive read {len(calls)} times for a missing pet"
+    print("ok   a pet missing from the app is looked up once per app version")
+
+
 def test_missing_codex(ab):
     ab.CODEX_ASARS = ("/nope/Codex.app/Contents/Resources/app.asar",)
     ab.PET_DIRS = []
@@ -232,5 +256,6 @@ if __name__ == "__main__":
     test_icons(ab)
     test_cache_and_optout(ab)
     test_local_pet_folder(ab)
+    test_unknown_pet_is_remembered(ab)
     test_missing_codex(ab)  # mutates paths, so it runs last
     print("\nall checks passed")
