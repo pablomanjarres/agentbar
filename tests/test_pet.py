@@ -186,9 +186,10 @@ def test_local_pet_folder(ab):
             for col in range(ab.PET_COLS):
                 block = Image.new("RGBA", (10 + col, 40 + row * 5), (row * 30, col * 30, 90, 255))
                 sheet.paste(block, (col * 24 + 2, row * ab.PET_CELL_H + 10))
-        sheet.save(os.path.join(folder, "sheet.png"))
+        os.makedirs(os.path.join(folder, "art"))
+        sheet.save(os.path.join(folder, "art", "sheet.png"))
         with open(os.path.join(folder, "pet.json"), "w") as f:
-            f.write('{"id": "kick", "displayName": "Kick", "spritesheetPath": "sheet.png"}')
+            f.write('{"id": "kick", "displayName": "Kick", "spritesheetPath": "art/sheet.png"}')
         with open(os.path.join(tmp, "choice"), "w") as f:
             f.write("kick\n")
         saved = (ab.PET_DIRS, ab.PET_CHOICE_PATH, ab.PET_DIR, ab.HIDE_PET_FLAG)
