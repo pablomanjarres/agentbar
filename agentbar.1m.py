@@ -1337,6 +1337,11 @@ def handle_action(argv):
         pause_auto()
     elif argv[0] == "resume-auto":
         resume_auto()
+    # both items draw the same menu; refresh=true only reruns the one clicked
+    try:
+        subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshallplugins"], timeout=10)
+    except Exception:
+        pass
     sys.exit(0)
 
 
