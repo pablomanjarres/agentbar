@@ -178,6 +178,8 @@ RUST = "#e07a42"
 GREEN = "#34a853"
 ORANGE = "#ff9500"
 RED = "#ff3b30"
+# cswap usage keys for the account-wide rate-limit windows, with their labels
+CLAUDE_WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
 CIRCLED = "➊➋➌➍➎➏➐➑➒➓"
 
 FAST_TTL = 50      # seconds: today + active block
@@ -1403,7 +1405,7 @@ def account_windows(lastgood):
     if not lastgood:
         return
     standard = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+    for key, label in CLAUDE_WINDOWS:
         w = claude_window(lastgood.get(key))
         if w:
             standard.append(w)
@@ -1477,7 +1479,7 @@ def pooled_pct(members, usage, caps, key):
     for num in members:
         cap = caps.get(num, 100.0)
         good = (usage.get(num) or {}).get("lastGood") or {}
-        windows = {k: claude_window(good.get(k)) for k in ("five_hour", "seven_day")}
+        windows = {k: claude_window(good.get(k)) for k, _ in CLAUDE_WINDOWS}
         blocked = any(w and not w["stale"] and w["pct"] >= cap for w in windows.values())
         w = windows[key]
         if not w:
