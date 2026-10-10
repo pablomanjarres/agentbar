@@ -97,16 +97,25 @@ CODEX_SFIMAGE = "chevron.left.forwardslash.chevron.right"
 # The art is OpenAI's, so this plugin does NOT carry a copy. It reads the sheet
 # out of the local Codex install, crops the frames it needs once, and caches
 # them. No Codex app, no pet. No Pillow, no pet. Nothing else breaks either way.
-CODEX_ASAR = "/Applications/Codex.app/Contents/Resources/app.asar"
+# Codex has shipped as its own app and, later, inside ChatGPT.app.
+CODEX_ASARS = (
+    "/Applications/Codex.app/Contents/Resources/app.asar",
+    "/Applications/ChatGPT.app/Contents/Resources/app.asar",
+)
+# Custom pets made in Codex are stored in the cloud. A local copy goes in a
+# folder shaped like Codex's own ~/.codex/pets/<name>/: a pet.json naming its
+# spritesheetPath, beside the sheet. agentbar's folder is searched first so a
+# copy made for the menu bar never shows up twice in Codex's own pet picker.
+PET_DIRS = [os.path.join(CONFIG_DIR, "pets"), os.path.join(CODEX_ROOT, "pets")]
+# One line naming the pet to wear: a folder above, or a pet bundled with Codex.
+PET_CHOICE_PATH = os.path.join(CONFIG_DIR, "pet")
 PET_DIR = os.path.join(CACHE_DIR, "pet")
 HIDE_PET_FLAG = os.path.join(CACHE_DIR, "hide-pet")
 # Bump when the crop changes shape: moods, cell geometry or bar height. The
-# cache key is the asar's mtime, which does not move when this file does, so
+# cache key is the sheet's mtime, which does not move when this file does, so
 # without it a fix would never reach anyone who already has cached frames.
 PET_CACHE_VERSION = 2
-PET_NAME = "seedy"
-PET_LABEL = "Seedy"
-PET_BLURB = "Small green shoots for new ideas."
+DEFAULT_PET = "seedy"
 PET_BAR_PX = 36  # 18pt at 144 dpi, matching ICON. See the dpi= on save().
 # Frame geometry read off the sheet the Codex app animates. Columns and cell
 # height have been stable across sprite versions; a sheet that does not divide
@@ -122,9 +131,6 @@ PET_MOODS = {
     "strained": (5, 0),
     "spent": (5, 2),
 }
-# Gap between the Claude glyph and the pet, in the 144 dpi pixel space both
-# are drawn in, so the pair reads as one item rather than two.
-PET_GAP_PX = 5
 PET_CAPTIONS = {
     "calm": "plenty of headroom",
     "working": "on the clock",
@@ -792,21 +798,78 @@ def asar_lookup(path, wanted):
         return f.read(int(entry["size"]))
 
 
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def codex_asar():
+    """Path of the installed Codex app archive, or None."""
+    return next((path for path in CODEX_ASARS if os.path.isfile(path)), None)
+
+
+def pet_name():
+    try:
+        with open(PET_CHOICE_PATH) as f:
+            return f.read().strip().lower() or DEFAULT_PET
+    except OSError:
+        return DEFAULT_PET
+
+
+def pet_folder(name):
+    """(folder, pet.json) of a local pet, or (None, {})."""
+    for root in PET_DIRS:
+        folder = os.path.join(root, name)
+        meta = load_json(os.path.join(folder, "pet.json"))
+        if isinstance(meta, dict):
+            return folder, meta
+    return None, {}
+
+
+def pet_label():
+    name = pet_name()
+    _, meta = pet_folder(name)
+    return meta.get("displayName") or meta.get("name") or name.title()
+
+
+def pet_sheet(name):
+    """(path, reader) for a pet's sprite sheet, or None when it has none here.
+
+    The path's mtime dates the art for the frame cache; the reader returns the
+    sheet's bytes and is only called on a cache miss.
+    """
+    folder, meta = pet_folder(name)
+    rel = meta.get("spritesheetPath") or meta.get("spritesheet")
+    if folder and rel:
+        path = os.path.join(folder, os.path.basename(rel))
+        if os.path.isfile(path):
+            return path, lambda: read_bytes(path)
+    asar = codex_asar()
+    if asar:
+        return asar, lambda: asar_lookup(asar, name + "-spritesheet")
+    return None
+
+
 def pet_icon(mood):
     """base64 PNG of one pet mood, or None when the pet cannot be drawn.
 
-    Cropped from the sprite sheet in the user's own Codex install and cached per
-    (sheet mtime, mood), so Pillow is touched on a version change and never on a
-    routine refresh.
+    Cropped from the pet's sprite sheet and cached per (pet, sheet mtime,
+    mood), so Pillow is touched on a version change and never on a routine
+    refresh.
     """
     if os.path.exists(HIDE_PET_FLAG) or mood not in PET_MOODS:
         return None
+    name = pet_name()
+    sheet_at = pet_sheet(name)
+    if not sheet_at:
+        return None  # no Codex install and no local pet
+    path, read_sheet = sheet_at
     try:
-        stamp = int(os.path.getmtime(CODEX_ASAR))
+        stamp = int(os.path.getmtime(path))
     except OSError:
-        return None  # Codex not installed
+        return None
     cached = os.path.join(
-        PET_DIR, f"{PET_NAME}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
+        PET_DIR, f"{name}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
     )
     try:
         with open(cached) as f:
@@ -818,9 +881,9 @@ def pet_icon(mood):
     except Exception:
         return None
     try:
-        # asar_lookup reads a third-party binary that Codex rewrites on update;
-        # a truncated or mid-write archive must not take the menu bar down
-        blob = asar_lookup(CODEX_ASAR, PET_NAME + "-spritesheet")
+        # the asar is a third-party binary that Codex rewrites on update; a
+        # truncated or mid-write archive must not take the menu bar down
+        blob = read_sheet()
         if not blob:
             return None
         sheet = Image.open(io.BytesIO(blob)).convert("RGBA")
@@ -844,57 +907,6 @@ def pet_icon(mood):
         data = base64.b64encode(buf.getvalue()).decode()
     except Exception:
         return None
-    try:
-        os.makedirs(PET_DIR, exist_ok=True)
-        atomic_write_text(cached, data)
-    except OSError:
-        pass
-    return data
-
-
-def title_icon(mood):
-    """Both marks in one image: the Claude glyph, then the pet.
-
-    SwiftBar allows one image per line, and dropping the Claude glyph for the
-    pet quietly removed the only sign that this item tracks Claude at all. They
-    are composited instead, at the same 36px/144 dpi as ICON so the pair keeps
-    the height a menu bar item is allowed.
-
-    Falls back to the bare glyph whenever the pet cannot be drawn, which is the
-    behaviour every other pet path already has.
-    """
-    pet = pet_icon(mood)
-    if not pet:
-        return ICON
-    # Keyed on the asar's mtime as well, exactly like pet_icon: without it a new
-    # sprite sheet regenerates the frame but this composite keeps serving the
-    # old one until PET_CACHE_VERSION is bumped in source.
-    try:
-        stamp = int(os.path.getmtime(CODEX_ASAR))
-    except OSError:
-        return ICON
-    cached = os.path.join(
-        PET_DIR, f"title-{PET_NAME}-{mood}-v{PET_CACHE_VERSION}-{stamp}.b64"
-    )
-    try:
-        with open(cached) as f:
-            return f.read()
-    except OSError:
-        pass
-    try:
-        from PIL import Image
-
-        left = Image.open(io.BytesIO(base64.b64decode(ICON))).convert("RGBA")
-        right = Image.open(io.BytesIO(base64.b64decode(pet))).convert("RGBA")
-        height = max(left.height, right.height)
-        out = Image.new("RGBA", (left.width + PET_GAP_PX + right.width, height), (0, 0, 0, 0))
-        out.alpha_composite(left, (0, height - left.height))
-        out.alpha_composite(right, (left.width + PET_GAP_PX, height - right.height))
-        buf = io.BytesIO()
-        out.save(buf, format="PNG", optimize=True, dpi=(144, 144))
-        data = base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        return ICON
     try:
         os.makedirs(PET_DIR, exist_ok=True)
         atomic_write_text(cached, data)
@@ -1674,10 +1686,8 @@ def main():
             note = "credits: none (plan allowance only)"
         print(f"   {note} | size=11 color={GRAY} trim=false")
         if pet:
-            # the pet alone here: this row is about him, and the composite
-            # would paste the Claude glyph in front of his own name
             print(
-                f"   {PET_LABEL} · {PET_CAPTIONS.get(mood, mood)} | image={pet} "
+                f"   {pet_label()} · {PET_CAPTIONS.get(mood, mood)} | image={pet} "
                 f"size=11 color={GRAY} trim=false"
             )
         if stats.get("codex_error"):
