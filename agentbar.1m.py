@@ -884,6 +884,11 @@ def pet_icon(mood):
             return f.read()
     except OSError:
         pass
+    # a name the sheet does not hold is remembered per sheet version, so the
+    # archive is not parsed again every minute just to find nothing
+    missing = os.path.join(PET_DIR, f"{name}-missing-v{PET_CACHE_VERSION}-{stamp}")
+    if os.path.exists(missing):
+        return None
     try:
         from PIL import Image  # optional: no Pillow, no pet
     except Exception:
@@ -893,6 +898,8 @@ def pet_icon(mood):
         # truncated or mid-write archive must not take the menu bar down
         blob = read_sheet()
         if not blob:
+            os.makedirs(PET_DIR, exist_ok=True)
+            open(missing, "w").close()
             return None
         sheet = Image.open(io.BytesIO(blob)).convert("RGBA")
         cw = sheet.width // PET_COLS
