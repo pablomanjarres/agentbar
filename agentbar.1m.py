@@ -35,6 +35,7 @@ Actions re-invoke this file with argv: switch <n> | refresh-stats | rebuild-ledg
 """
 import base64
 import datetime
+import fcntl
 import io
 import json
 import math
@@ -936,7 +937,22 @@ def pet_mood(worst, busy, limit_reached):
 
 
 def refresh_stats(force=False, active_num=None):
+    """Cached stats, refreshed past their TTLs.
+
+    Both menu bar items tick in the same minute. The lock makes the second wait
+    for the first and then find the stats fresh, instead of running ccusage and
+    the network lane a second time alongside it.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(os.path.join(CACHE_DIR, "refresh.lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:
+            pass  # no lock is a duplicate refresh, never a missing menu
+        return _refresh_stats(force, active_num)
+
+
+def _refresh_stats(force, active_num):
     st = load_json(STATS_PATH) or {}
     now = time.time()
     changed = False
