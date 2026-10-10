@@ -1312,10 +1312,15 @@ def handle_action(argv):
     sys.exit(0)
 
 
+def is_api_key_account(email):
+    """claude-swap files setup-token (API billing) logins under @token.local."""
+    return (email or "").endswith("@token.local")
+
+
 def display_email(email, hidden):
     if not hidden:
         return email
-    if email.endswith("@token.local"):
+    if is_api_key_account(email):
         return "API key account"
     local, _, domain = email.partition("@")
     return f"{local[:1]}•••@{domain[:1]}•••"
@@ -1406,7 +1411,7 @@ def pooled_pct(accounts, usage, caps, key):
     used = capacity = 0.0
     live = False
     for num, meta in accounts.items():
-        if (meta.get("email") or "").endswith("@token.local"):
+        if is_api_key_account(meta.get("email")):
             continue
         cap = caps.get(num, 100.0)
         capacity += cap
@@ -1420,7 +1425,7 @@ def pooled_pct(accounts, usage, caps, key):
 def print_account(num, meta, usage, active, hidden, cap=100.0):
     """One summary row, with full usage and manual switching in its submenu."""
     email = meta.get("email", f"account {num}")
-    token_account = email.endswith("@token.local")
+    token_account = is_api_key_account(email)
     lastgood = usage.get("lastGood") or {}
     windows = list(account_windows(lastgood))
     summary = []
