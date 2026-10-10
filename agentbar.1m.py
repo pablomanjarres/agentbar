@@ -1343,7 +1343,45 @@ def account_windows(lastgood):
             yield scoped.get("name", "model")[:5], w
 
 
-def print_account(num, meta, usage, active, hidden):
+def usage_caps(accounts):
+    """Per-account usage cap in percent, from claude-swap's auto-switch policy.
+
+    The daemon moves off an account once it reaches its cap, so a cap below 100
+    holds the rest of that account in reserve and it never drains fully.
+    """
+    policy = load_json(os.path.join(CSWAP_ROOT, "autoswitch-policy.json")) or {}
+    default = float(policy.get("defaultUsageCap") or 100)
+    by_uuid = policy.get("accountUsageCaps") or {}
+    return {
+        num: float(by_uuid.get(meta.get("uuid") or "", default))
+        for num, meta in accounts.items()
+    }
+
+
+def pooled_pct(accounts, usage, caps, key):
+    """One window's use across every account auto-switch rotates through.
+
+    Each account adds its cap to the pool and its use, clamped to that cap, to
+    the total: four accounts at 100% make a 400% pool, so one spent account
+    moves the number by 25% rather than to 100%. API-key accounts are billed per
+    token and stay out. A window whose reset has passed counts as unused. None
+    when no account has a live reading for this window at all.
+    """
+    used = capacity = 0.0
+    live = False
+    for num, meta in accounts.items():
+        if (meta.get("email") or "").endswith("@token.local"):
+            continue
+        cap = caps.get(num, 100.0)
+        capacity += cap
+        w = claude_window(((usage.get(num) or {}).get("lastGood") or {}).get(key))
+        if w and not w["stale"]:
+            used += min(w["pct"], cap)
+            live = True
+    return used / capacity * 100 if live and capacity else None
+
+
+def print_account(num, meta, usage, active, hidden, cap=100.0):
     """One summary row, with full usage and manual switching in its submenu."""
     email = meta.get("email", f"account {num}")
     token_account = email.endswith("@token.local")
@@ -1359,6 +1397,8 @@ def print_account(num, meta, usage, active, hidden):
         summary = ["manual"]
     elif not summary:
         summary = ["no usage"]
+    if cap < 100 and not token_account:
+        summary.append(f"reserve · cap {cap:.0f}%")
     error = usage.get("lastError")
     if error and not token_account:
         summary.append(f"⚠ {str(error)[:24]}")
@@ -1543,36 +1583,18 @@ def main():
     stats = refresh_stats(active_num=active)
 
     # ---- menu bar title ----
-    act_usage = (usage.get(str(active)) or {}).get("lastGood") or {}
-
-    def live_pct(key):
-        """Percentage for one window, or None once its reset has gone by."""
-        w = claude_window(act_usage.get(key))
-        return None if not w or w.get("stale") else w["pct"]
-
-    p5 = live_pct("five_hour")
-    p7 = live_pct("seven_day")
+    caps = usage_caps(accounts)
+    p5 = pooled_pct(accounts, usage, caps, "five_hour")
+    p7 = pooled_pct(accounts, usage, caps, "seven_day")
     codex_usage = stats.get("codex_usage")
     # a cached reading is kept across a failed refresh, so expired windows are
     # dropped before anything colours the menu bar off them
     codex_wins = fresh_windows((codex_usage or {}).get("windows") or [])
     codex_pcts = [w["pct"] for _, w in codex_wins]
-    # the warning colour tracks whichever agent is closest to its wall
-    all_pcts = [
-        w["pct"] for _, w in account_windows(act_usage) if not w.get("stale")
-    ] + codex_pcts
-    worst = max(all_pcts) if all_pcts else 0
-    prefix = ""
-    if has_cswap and not daemon:
-        prefix = "⚠️ "
-    elif worst >= 90:
-        prefix = "🔴 "
-    elif worst >= 75:
-        prefix = "🟠 "
-    circ = CIRCLED[active - 1] if active and active <= 10 else "•"
+    prefix = "⚠️ " if has_cswap and not daemon else ""
     # an account can report one window without the other; format whatever is there
     shown = [f"{pct:.0f}%" for pct in (p5, p7) if pct is not None]
-    claude_bit = f"{circ} {'·'.join(shown)}" if shown else circ
+    claude_bit = "·".join(shown) if shown else "–"
     # both agents share one title line so neither is hidden behind a cycle
     codex_bit = f"  {CODEX_MARK} {max(codex_pcts):.0f}%" if codex_pcts else ""
     today = stats.get("today")
@@ -1583,7 +1605,8 @@ def main():
     # cached flag describes a window that is already over.
     busy = bool((block or {}).get("perHour")) or codex_today > 0
     hit_limit = bool((codex_usage or {}).get("limit_reached")) and bool(codex_wins)
-    mood = pet_mood(worst, busy, hit_limit)
+    # the pet stands for Codex, so he reacts to Codex's own windows
+    mood = pet_mood(max(codex_pcts) if codex_pcts else 0, busy, hit_limit)
     # two images: the pair for the menu bar title, the pet alone for its own row
     pet = pet_icon(mood)
     icon = title_icon(mood)
@@ -1598,13 +1621,16 @@ def main():
 
     # ---- accounts ----
     if has_cswap:
-        print(f"Claude accounts · active window used (5h·7d) | size=11 color={GRAY}")
+        print(f"Claude accounts · pooled use in the title (5h·7d) | size=11 color={GRAY}")
     else:
         print(
             f"Claude accounts · claude-swap not set up, gauges off | size=11 color={GRAY}"
         )
     for num in order:  # empty when claude-swap has no accounts
-        print_account(num, accounts.get(str(num), {}), usage.get(str(num), {}), active, hidden)
+        print_account(
+            num, accounts.get(str(num), {}), usage.get(str(num), {}), active, hidden,
+            cap=caps.get(str(num), 100.0),
+        )
 
     # ---- codex / chatgpt account ----
     print("---")
